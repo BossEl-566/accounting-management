@@ -19,8 +19,8 @@ import {
 } from "recharts";
 
 import StatCard from "./components/StatCard";
-import { Bank, DashboardSummary, getBanks, getDashboardSummary } from "./libs/api";
-import { formatGHS } from "./libs/format";
+import { Bank, DashboardSummary, getBanks, getDashboardSummary } from "./lib/api";
+import { formatGHS } from "./lib/format";
 
 export default function DashboardPage() {
   const [summary, setSummary] = useState<DashboardSummary | null>(null);
