@@ -44,11 +44,14 @@ export type ReceiptSheetDetail = ReceiptSheet & {
   entries: ReceiptEntry[];
 };
 
+export type PaymentSource = "bank" | "petty_cash";
+
 export type PaymentEntryInput = {
   category: string;
   subcategory: string;
   amount: number;
-  bank_id: number;
+  bank_id?: number | null;
+  source: PaymentSource;
   note?: string | null;
 };
 
@@ -58,11 +61,27 @@ export type PaymentEntry = {
   category: string;
   subcategory: string;
   amount: number;
-  bank_id: number;
+  bank_id: number | null;
   bank_name: string | null;
+  source: PaymentSource;
   note: string | null;
   created_at: string;
   updated_at: string;
+};
+
+export type PettyCashSummary = {
+  balance: number;
+  total_withdrawn: number;
+  total_spent: number;
+};
+
+export type PettyCashWithdrawal = {
+  id: number;
+  bank_id: number;
+  bank_name: string;
+  amount: number;
+  note: string | null;
+  created_at: string;
 };
 
 export type PaymentSheet = {
@@ -301,6 +320,50 @@ export async function deletePaymentSheet(
   id: number
 ): Promise<{ ok: boolean }> {
   const response = await fetch(`${API_BASE_URL}/payment-sheets/${id}`, {
+    method: "DELETE",
+  });
+
+  return handleResponse<{ ok: boolean }>(response);
+}
+
+export async function getPettyCashSummary(): Promise<PettyCashSummary> {
+  const response = await fetch(`${API_BASE_URL}/petty-cash/summary`, {
+    cache: "no-store",
+  });
+
+  return handleResponse<PettyCashSummary>(response);
+}
+
+export async function getPettyCashWithdrawals(): Promise<
+  PettyCashWithdrawal[]
+> {
+  const response = await fetch(`${API_BASE_URL}/petty-cash/withdrawals`, {
+    cache: "no-store",
+  });
+
+  return handleResponse<PettyCashWithdrawal[]>(response);
+}
+
+export async function createPettyCashWithdrawal(payload: {
+  bank_id: number;
+  amount: number;
+  note?: string | null;
+}): Promise<PettyCashWithdrawal> {
+  const response = await fetch(`${API_BASE_URL}/petty-cash/withdrawals`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  return handleResponse<PettyCashWithdrawal>(response);
+}
+
+export async function deletePettyCashWithdrawal(
+  id: number
+): Promise<{ ok: boolean }> {
+  const response = await fetch(`${API_BASE_URL}/petty-cash/withdrawals/${id}`, {
     method: "DELETE",
   });
 

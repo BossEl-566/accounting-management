@@ -8,6 +8,7 @@ import {
   Save,
   Send,
   Trash2,
+  Wallet,
 } from "lucide-react";
 
 import {
@@ -15,11 +16,18 @@ import {
   PaymentEntry,
   PaymentEntryInput,
   PaymentSheet,
+  PaymentSource,
+  PettyCashSummary,
+  PettyCashWithdrawal,
+  createPettyCashWithdrawal,
   deletePaymentSheet,
+  deletePettyCashWithdrawal,
   getBanks,
   getLatestPaymentDraft,
   getPaymentSheet,
   getPaymentSheets,
+  getPettyCashSummary,
+  getPettyCashWithdrawals,
   postPaymentSheet,
   savePaymentDraft,
   updatePostedPaymentSheet,
@@ -32,6 +40,7 @@ type PaymentFormRow = {
   subcategory: string;
   amount: string;
   bank_id: string;
+  source: PaymentSource;
   note: string;
   isCustom?: boolean;
 };
@@ -41,6 +50,16 @@ const sheetTitles = [
   "Weekly Payment Sheet",
   "Monthly Payment Sheet",
   "Special Program Payment Sheet",
+];
+
+const pettyCashCategories = [
+  "Utilities",
+  "Donation & Support",
+  "Decor",
+  "Telephone & Communication",
+  "Repairs & Maintenance",
+  "Publicity",
+  "Decoration",
 ];
 
 const basePaymentRows = [
@@ -112,6 +131,7 @@ function buildBlankRows(defaultBankId: string): PaymentFormRow[] {
     subcategory,
     amount: "",
     bank_id: defaultBankId,
+    source: "bank",
     note: "",
   }));
 }
@@ -123,26 +143,32 @@ function mergeSavedEntriesIntoRows(
   const rows = buildBlankRows(defaultBankId);
 
   for (const entry of savedEntries) {
-    const existingRow = rows.find(
-      (row) =>
-        row.category === entry.category && row.subcategory === entry.subcategory
-    );
+    if (entry.source === "bank") {
+      const existingRow = rows.find(
+        (row) =>
+          row.category === entry.category &&
+          row.subcategory === entry.subcategory &&
+          row.source === "bank"
+      );
 
-    if (existingRow) {
-      existingRow.amount = String(entry.amount);
-      existingRow.bank_id = String(entry.bank_id);
-      existingRow.note = entry.note ?? "";
-    } else {
-      rows.push({
-        rowId: makeRowId(),
-        category: entry.category,
-        subcategory: entry.subcategory,
-        amount: String(entry.amount),
-        bank_id: String(entry.bank_id),
-        note: entry.note ?? "",
-        isCustom: true,
-      });
+      if (existingRow) {
+        existingRow.amount = String(entry.amount);
+        existingRow.bank_id = String(entry.bank_id ?? "");
+        existingRow.note = entry.note ?? "";
+        continue;
+      }
     }
+
+    rows.push({
+      rowId: makeRowId(),
+      category: entry.category,
+      subcategory: entry.subcategory,
+      amount: String(entry.amount),
+      bank_id: entry.bank_id ? String(entry.bank_id) : "",
+      source: entry.source,
+      note: entry.note ?? "",
+      isCustom: true,
+    });
   }
 
   return rows;
@@ -151,6 +177,9 @@ function mergeSavedEntriesIntoRows(
 export default function PaymentsPage() {
   const [banks, setBanks] = useState<Bank[]>([]);
   const [sheets, setSheets] = useState<PaymentSheet[]>([]);
+  const [pettyCashSummary, setPettyCashSummary] =
+    useState<PettyCashSummary | null>(null);
+  const [withdrawals, setWithdrawals] = useState<PettyCashWithdrawal[]>([]);
 
   const [sheetId, setSheetId] = useState<number | null>(null);
   const [sheetStatus, setSheetStatus] = useState<"new" | "draft" | "posted">(
@@ -158,6 +187,15 @@ export default function PaymentsPage() {
   );
   const [sheetTitle, setSheetTitle] = useState("Sunday Payment Sheet");
   const [rows, setRows] = useState<PaymentFormRow[]>([]);
+
+  const [withdrawBankId, setWithdrawBankId] = useState("");
+  const [withdrawAmount, setWithdrawAmount] = useState("");
+  const [withdrawNote, setWithdrawNote] = useState("");
+
+  const [pettyCategory, setPettyCategory] = useState("Utilities");
+  const [pettyName, setPettyName] = useState("");
+  const [pettyAmount, setPettyAmount] = useState("");
+  const [pettyNote, setPettyNote] = useState("");
 
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
@@ -182,16 +220,30 @@ export default function PaymentsPage() {
     try {
       setError("");
 
-      const [bankData, draftData, sheetData] = await Promise.all([
+      const [
+        bankData,
+        draftData,
+        sheetData,
+        pettySummaryData,
+        withdrawalData,
+      ] = await Promise.all([
         getBanks(),
         getLatestPaymentDraft(),
         getPaymentSheets(),
+        getPettyCashSummary(),
+        getPettyCashWithdrawals(),
       ]);
 
       setBanks(bankData);
       setSheets(sheetData);
+      setPettyCashSummary(pettySummaryData);
+      setWithdrawals(withdrawalData);
 
       const firstBankId = bankData.length > 0 ? String(bankData[0].id) : "";
+
+      if (!withdrawBankId && firstBankId) {
+        setWithdrawBankId(firstBankId);
+      }
 
       if (draftData) {
         setSheetId(draftData.id);
@@ -245,9 +297,9 @@ export default function PaymentsPage() {
         continue;
       }
 
-      if (!row.bank_id) {
+      if (row.source === "bank" && !row.bank_id) {
         if (strict) {
-          throw new Error("Every filled amount must have a selected bank.");
+          throw new Error("Every bank payment must have a selected bank.");
         }
 
         continue;
@@ -257,7 +309,8 @@ export default function PaymentsPage() {
         category: row.category.trim(),
         subcategory: row.subcategory.trim(),
         amount,
-        bank_id: Number(row.bank_id),
+        bank_id: row.source === "bank" ? Number(row.bank_id) : null,
+        source: row.source,
         note: row.note.trim() || null,
       });
     }
@@ -297,6 +350,101 @@ export default function PaymentsPage() {
     return () => window.clearTimeout(timer);
   }, [rows, sheetTitle, sheetId, sheetStatus, hasLoadedInitialData, banks.length]);
 
+  async function handleWithdrawPettyCash(event: React.FormEvent) {
+    event.preventDefault();
+
+    const parsedAmount = Number(withdrawAmount);
+    const parsedBankId = Number(withdrawBankId);
+
+    if (!parsedBankId) {
+      setError("Please select the bank to withdraw petty cash from.");
+      return;
+    }
+
+    if (Number.isNaN(parsedAmount) || parsedAmount <= 0) {
+      setError("Petty cash withdrawal amount must be greater than zero.");
+      return;
+    }
+
+    try {
+      setError("");
+      setSuccess("");
+
+      await createPettyCashWithdrawal({
+        bank_id: parsedBankId,
+        amount: parsedAmount,
+        note: withdrawNote.trim() || null,
+      });
+
+      setWithdrawAmount("");
+      setWithdrawNote("");
+      setSuccess("Petty cash withdrawn successfully. Bank balance has been deducted.");
+      await loadInitialData();
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Failed to withdraw petty cash."
+      );
+    }
+  }
+
+  async function handleDeleteWithdrawal(id: number) {
+    const confirmed = window.confirm(
+      "Delete this petty cash withdrawal? The amount will be returned to the bank if it has not already been spent."
+    );
+
+    if (!confirmed) return;
+
+    try {
+      setError("");
+      setSuccess("");
+
+      await deletePettyCashWithdrawal(id);
+
+      setSuccess("Petty cash withdrawal deleted successfully.");
+      await loadInitialData();
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Failed to delete withdrawal."
+      );
+    }
+  }
+
+  function addPettyCashExpenseToSheet(event: React.FormEvent) {
+    event.preventDefault();
+
+    const parsedAmount = Number(pettyAmount);
+
+    if (!pettyName.trim()) {
+      setError("Enter the petty cash expense name.");
+      return;
+    }
+
+    if (Number.isNaN(parsedAmount) || parsedAmount <= 0) {
+      setError("Petty cash expense amount must be greater than zero.");
+      return;
+    }
+
+    setRows((currentRows) => [
+      ...currentRows,
+      {
+        rowId: makeRowId(),
+        category: pettyCategory,
+        subcategory: pettyName.trim(),
+        amount: pettyAmount,
+        bank_id: "",
+        source: "petty_cash",
+        note: pettyNote.trim(),
+        isCustom: true,
+      },
+    ]);
+
+    setPettyName("");
+    setPettyAmount("");
+    setPettyNote("");
+    setError("");
+    setSuccess("Petty cash expense added to the payment sheet.");
+  }
+
   async function handlePostSheet() {
     try {
       setError("");
@@ -318,7 +466,7 @@ export default function PaymentsPage() {
         });
 
         setSuccess(
-          "Posted payment sheet updated successfully. Bank balances have been corrected."
+          "Posted payment sheet updated successfully. Bank and petty cash balances have been corrected."
         );
         await loadInitialData();
         return;
@@ -332,7 +480,7 @@ export default function PaymentsPage() {
 
       await postPaymentSheet(savedDraft.id);
 
-      setSuccess("Payment sheet posted successfully. Banks have been deducted.");
+      setSuccess("Payment sheet posted successfully.");
       startNewSheet();
       await loadInitialData();
     } catch (err) {
@@ -362,7 +510,7 @@ export default function PaymentsPage() {
       setRows(mergeSavedEntriesIntoRows(sheet.entries, defaultBankId));
       setDraftMessage(
         sheet.status === "posted"
-          ? "Viewing posted sheet. Changes affect banks only when you save."
+          ? "Viewing posted sheet. Changes affect banks and petty cash only when you save."
           : "Draft loaded."
       );
     } catch (err) {
@@ -372,7 +520,7 @@ export default function PaymentsPage() {
 
   async function handleDeleteSheet(id: number) {
     const confirmed = window.confirm(
-      "Delete this payment sheet? If it is already posted, the bank deductions will be reversed."
+      "Delete this payment sheet? Posted bank deductions will be reversed and petty cash expenses will be removed."
     );
 
     if (!confirmed) return;
@@ -399,6 +547,7 @@ export default function PaymentsPage() {
         subcategory: "",
         amount: "",
         bank_id: defaultBankId,
+        source: "bank",
         note: "",
         isCustom: true,
       },
@@ -434,8 +583,7 @@ export default function PaymentsPage() {
             Payments
           </h1>
           <p className="mt-2 text-sm font-medium text-slate-500">
-            Create full payment sheets, auto-save drafts, and post them to
-            deduct selected banks.
+            Record bank payments and petty cash expenses without double deduction.
           </p>
         </div>
 
@@ -457,6 +605,136 @@ export default function PaymentsPage() {
         </div>
       )}
 
+      <section className="grid grid-cols-3 gap-5">
+        <div className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
+          <div className="flex items-center gap-3">
+            <div className="rounded-2xl bg-amber-50 p-3 text-amber-600">
+              <Wallet size={20} />
+            </div>
+            <div>
+              <p className="text-sm font-bold text-slate-500">Petty Cash Balance</p>
+              <p className="mt-1 text-2xl font-black text-slate-950">
+                {formatGHS(pettyCashSummary?.balance ?? 0)}
+              </p>
+            </div>
+          </div>
+
+          <div className="mt-5 grid grid-cols-2 gap-3 text-sm">
+            <div className="rounded-2xl bg-slate-50 p-4">
+              <p className="text-xs font-bold text-slate-500">Withdrawn</p>
+              <p className="mt-1 font-black text-slate-950">
+                {formatGHS(pettyCashSummary?.total_withdrawn ?? 0)}
+              </p>
+            </div>
+
+            <div className="rounded-2xl bg-slate-50 p-4">
+              <p className="text-xs font-bold text-slate-500">Spent</p>
+              <p className="mt-1 font-black text-red-700">
+                {formatGHS(pettyCashSummary?.total_spent ?? 0)}
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <form
+          onSubmit={handleWithdrawPettyCash}
+          className="col-span-2 rounded-3xl border border-slate-200 bg-white p-6 shadow-sm"
+        >
+          <h2 className="text-lg font-black text-slate-950">
+            Withdraw Petty Cash
+          </h2>
+          <p className="mt-1 text-sm text-slate-500">
+            This deducts from the selected bank once and increases petty cash.
+          </p>
+
+          <div className="mt-5 grid grid-cols-4 gap-4">
+            <select
+              value={withdrawBankId}
+              onChange={(event) => setWithdrawBankId(event.target.value)}
+              className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-semibold outline-none focus:border-blue-500"
+            >
+              {banks.map((bank) => (
+                <option key={bank.id} value={bank.id}>
+                  {bank.name} - {formatGHS(bank.balance)}
+                </option>
+              ))}
+            </select>
+
+            <input
+              value={withdrawAmount}
+              onChange={(event) => setWithdrawAmount(event.target.value)}
+              type="number"
+              min="0.01"
+              step="0.01"
+              placeholder="Amount"
+              className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-semibold outline-none focus:border-blue-500"
+            />
+
+            <input
+              value={withdrawNote}
+              onChange={(event) => setWithdrawNote(event.target.value)}
+              placeholder="Optional note"
+              className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-semibold outline-none focus:border-blue-500"
+            />
+
+            <button className="rounded-2xl bg-amber-600 px-5 py-3 text-sm font-black text-white hover:bg-amber-700">
+              Withdraw
+            </button>
+          </div>
+        </form>
+      </section>
+
+      <section className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
+        <h2 className="text-lg font-black text-slate-950">
+          Add Petty Cash Expense to Payment Sheet
+        </h2>
+        <p className="mt-1 text-sm text-slate-500">
+          These expenses will reduce petty cash, not the bank.
+        </p>
+
+        <form onSubmit={addPettyCashExpenseToSheet} className="mt-5 grid grid-cols-5 gap-4">
+          <select
+            value={pettyCategory}
+            onChange={(event) => setPettyCategory(event.target.value)}
+            className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-semibold outline-none focus:border-blue-500"
+          >
+            {pettyCashCategories.map((category) => (
+              <option key={category} value={category}>
+                {category}
+              </option>
+            ))}
+          </select>
+
+          <input
+            value={pettyName}
+            onChange={(event) => setPettyName(event.target.value)}
+            placeholder="Expense name"
+            className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-semibold outline-none focus:border-blue-500"
+          />
+
+          <input
+            value={pettyAmount}
+            onChange={(event) => setPettyAmount(event.target.value)}
+            type="number"
+            min="0.01"
+            step="0.01"
+            placeholder="Amount"
+            className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-semibold outline-none focus:border-blue-500"
+          />
+
+          <input
+            value={pettyNote}
+            onChange={(event) => setPettyNote(event.target.value)}
+            placeholder="Optional note"
+            className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-semibold outline-none focus:border-blue-500"
+          />
+
+          <button className="rounded-2xl bg-blue-600 px-5 py-3 text-sm font-black text-white hover:bg-blue-700">
+            Add Expense
+          </button>
+        </form>
+      </section>
+
       <section className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
         <div className="mb-6 flex items-start justify-between gap-5">
           <div className="flex items-center gap-3">
@@ -471,7 +749,7 @@ export default function PaymentsPage() {
                   : "Create Payment Sheet"}
               </h2>
               <p className="text-sm text-slate-500">
-                Drafts auto-save while typing. Banks deduct only after posting.
+                Bank payments deduct banks. Petty cash expenses deduct petty cash.
               </p>
             </div>
           </div>
@@ -558,14 +836,17 @@ export default function PaymentsPage() {
               <table className="w-full border-collapse bg-white text-left">
                 <thead>
                   <tr className="border-t border-slate-100">
-                    <th className="w-[28%] px-5 py-3 text-xs font-black uppercase tracking-wide text-slate-500">
+                    <th className="w-[23%] px-5 py-3 text-xs font-black uppercase tracking-wide text-slate-500">
                       Payment Name
                     </th>
-                    <th className="w-[18%] px-5 py-3 text-xs font-black uppercase tracking-wide text-slate-500">
+                    <th className="w-[15%] px-5 py-3 text-xs font-black uppercase tracking-wide text-slate-500">
+                      Source
+                    </th>
+                    <th className="w-[15%] px-5 py-3 text-xs font-black uppercase tracking-wide text-slate-500">
                       Amount
                     </th>
                     <th className="w-[22%] px-5 py-3 text-xs font-black uppercase tracking-wide text-slate-500">
-                      Bank
+                      Bank / Cash
                     </th>
                     <th className="px-5 py-3 text-xs font-black uppercase tracking-wide text-slate-500">
                       Note
@@ -584,11 +865,7 @@ export default function PaymentsPage() {
                           <input
                             value={row.subcategory}
                             onChange={(event) =>
-                              updateRow(
-                                row.rowId,
-                                "subcategory",
-                                event.target.value
-                              )
+                              updateRow(row.rowId, "subcategory", event.target.value)
                             }
                             placeholder="Enter payment name"
                             className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-semibold outline-none focus:border-blue-500"
@@ -598,6 +875,19 @@ export default function PaymentsPage() {
                             {row.subcategory}
                           </p>
                         )}
+                      </td>
+
+                      <td className="px-5 py-3">
+                        <span
+                          className={[
+                            "rounded-full px-3 py-1 text-xs font-black",
+                            row.source === "petty_cash"
+                              ? "bg-amber-50 text-amber-700"
+                              : "bg-blue-50 text-blue-700",
+                          ].join(" ")}
+                        >
+                          {row.source === "petty_cash" ? "Petty Cash" : "Bank"}
+                        </span>
                       </td>
 
                       <td className="px-5 py-3">
@@ -615,19 +905,25 @@ export default function PaymentsPage() {
                       </td>
 
                       <td className="px-5 py-3">
-                        <select
-                          value={row.bank_id}
-                          onChange={(event) =>
-                            updateRow(row.rowId, "bank_id", event.target.value)
-                          }
-                          className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-semibold outline-none focus:border-blue-500"
-                        >
-                          {banks.map((bank) => (
-                            <option key={bank.id} value={bank.id}>
-                              {bank.name} - {formatGHS(bank.balance)}
-                            </option>
-                          ))}
-                        </select>
+                        {row.source === "petty_cash" ? (
+                          <div className="rounded-xl border border-amber-100 bg-amber-50 px-3 py-2 text-sm font-black text-amber-700">
+                            From Petty Cash
+                          </div>
+                        ) : (
+                          <select
+                            value={row.bank_id}
+                            onChange={(event) =>
+                              updateRow(row.rowId, "bank_id", event.target.value)
+                            }
+                            className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-semibold outline-none focus:border-blue-500"
+                          >
+                            {banks.map((bank) => (
+                              <option key={bank.id} value={bank.id}>
+                                {bank.name} - {formatGHS(bank.balance)}
+                              </option>
+                            ))}
+                          </select>
+                        )}
                       </td>
 
                       <td className="px-5 py-3">
@@ -688,7 +984,7 @@ export default function PaymentsPage() {
               Previous Payment Sheets
             </h2>
             <p className="text-sm text-slate-500">
-              Posted sheets have already deducted bank balances.
+              Posted sheets have already affected bank or petty cash balances.
             </p>
           </div>
         </div>
@@ -772,6 +1068,79 @@ export default function PaymentsPage() {
                         Delete
                       </button>
                     </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
+        <h2 className="text-lg font-black text-slate-950">
+          Petty Cash Withdrawals
+        </h2>
+
+        <div className="mt-5 overflow-hidden rounded-2xl border border-slate-200">
+          <table className="w-full border-collapse bg-white text-left">
+            <thead className="bg-slate-50">
+              <tr>
+                <th className="px-5 py-4 text-xs font-black uppercase tracking-wide text-slate-500">
+                  Date
+                </th>
+                <th className="px-5 py-4 text-xs font-black uppercase tracking-wide text-slate-500">
+                  Bank
+                </th>
+                <th className="px-5 py-4 text-xs font-black uppercase tracking-wide text-slate-500">
+                  Amount
+                </th>
+                <th className="px-5 py-4 text-xs font-black uppercase tracking-wide text-slate-500">
+                  Note
+                </th>
+                <th className="px-5 py-4 text-right text-xs font-black uppercase tracking-wide text-slate-500">
+                  Action
+                </th>
+              </tr>
+            </thead>
+
+            <tbody>
+              {withdrawals.length === 0 && (
+                <tr>
+                  <td
+                    colSpan={5}
+                    className="px-5 py-10 text-center text-sm font-semibold text-slate-500"
+                  >
+                    No petty cash withdrawals yet.
+                  </td>
+                </tr>
+              )}
+
+              {withdrawals.map((withdrawal) => (
+                <tr key={withdrawal.id} className="border-t border-slate-100">
+                  <td className="px-5 py-4 text-sm font-semibold text-slate-600">
+                    {new Date(withdrawal.created_at).toLocaleString()}
+                  </td>
+
+                  <td className="px-5 py-4 font-black text-slate-950">
+                    {withdrawal.bank_name}
+                  </td>
+
+                  <td className="px-5 py-4 font-black text-amber-700">
+                    {formatGHS(withdrawal.amount)}
+                  </td>
+
+                  <td className="px-5 py-4 text-sm font-semibold text-slate-500">
+                    {withdrawal.note ?? "-"}
+                  </td>
+
+                  <td className="px-5 py-4 text-right">
+                    <button
+                      type="button"
+                      onClick={() => handleDeleteWithdrawal(withdrawal.id)}
+                      className="rounded-xl bg-red-50 px-4 py-2 text-xs font-black text-red-600 hover:bg-red-100"
+                    >
+                      Delete
+                    </button>
                   </td>
                 </tr>
               ))}

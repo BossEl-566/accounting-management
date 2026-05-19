@@ -126,6 +126,7 @@ def serialize_payment_entry(row: sqlite3.Row):
         "amount": pesewas_to_money(row["amount_pesewas"]),
         "bank_id": row["bank_id"],
         "bank_name": row["bank_name"],
+        "source": row["source"],
         "note": row["note"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -168,6 +169,7 @@ def get_payment_sheet_detail(conn: sqlite3.Connection, sheet_id: int):
             payment_entries.amount_pesewas,
             payment_entries.bank_id,
             banks.name AS bank_name,
+            payment_entries.source,
             payment_entries.note,
             payment_entries.created_at,
             payment_entries.updated_at
@@ -203,6 +205,7 @@ def replace_payment_entries(
         category = entry.category.strip()
         subcategory = entry.subcategory.strip()
         note = clean_optional_text(entry.note)
+        source = normalize_payment_source(entry.source)
         amount_pesewas = money_to_pesewas(entry.amount)
 
         if not category:
@@ -211,7 +214,25 @@ def replace_payment_entries(
         if not subcategory:
             raise HTTPException(status_code=400, detail="Payment name is required.")
 
-        validate_bank_exists(conn, entry.bank_id)
+        bank_id = entry.bank_id
+
+        if source == "bank":
+            if bank_id is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Bank payment entry must have a selected bank.",
+                )
+
+            validate_bank_exists(conn, bank_id)
+
+        if source == "petty_cash":
+            bank_id = None
+
+            if category not in PETTY_CASH_ALLOWED_CATEGORIES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Petty cash cannot be used for {category}.",
+                )
 
         conn.execute(
             """
@@ -221,16 +242,18 @@ def replace_payment_entries(
                 subcategory,
                 amount_pesewas,
                 bank_id,
+                source,
                 note
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 sheet_id,
                 category,
                 subcategory,
                 amount_pesewas,
-                entry.bank_id,
+                bank_id,
+                source,
                 note,
             ),
         )
@@ -272,6 +295,186 @@ def validate_bank_exists(conn: sqlite3.Connection, bank_id: int):
         raise HTTPException(status_code=404, detail="Selected bank was not found.")
 
     return bank
+
+PETTY_CASH_ALLOWED_CATEGORIES = {
+    "Utilities",
+    "Donation & Support",
+    "Decor",
+    "Telephone & Communication",
+    "Repairs & Maintenance",
+    "Publicity",
+    "Decoration",
+}
+
+
+def normalize_payment_source(source: Optional[str]) -> str:
+    cleaned = (source or "bank").strip()
+
+    if cleaned not in ["bank", "petty_cash"]:
+        raise HTTPException(status_code=400, detail="Invalid payment source.")
+
+    return cleaned
+
+
+def group_bank_payment_amounts(entries: List[sqlite3.Row]):
+    grouped = {}
+
+    for entry in entries:
+        if entry["source"] != "bank":
+            continue
+
+        bank_id = entry["bank_id"]
+
+        if bank_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Bank payment entry is missing a bank.",
+            )
+
+        grouped[bank_id] = grouped.get(bank_id, 0) + entry["amount_pesewas"]
+
+    return grouped
+
+
+def sum_petty_cash_entries(entries: List[sqlite3.Row]) -> int:
+    total = 0
+
+    for entry in entries:
+        if entry["source"] == "petty_cash":
+            total += entry["amount_pesewas"]
+
+    return total
+
+
+def get_petty_cash_totals(conn: sqlite3.Connection, exclude_payment_sheet_id: Optional[int] = None):
+    total_withdrawn = conn.execute(
+        """
+        SELECT COALESCE(SUM(amount_pesewas), 0) AS total
+        FROM petty_cash_withdrawals
+        """
+    ).fetchone()["total"]
+
+    params = []
+    exclude_clause = ""
+
+    if exclude_payment_sheet_id is not None:
+        exclude_clause = "AND payment_sheets.id != ?"
+        params.append(exclude_payment_sheet_id)
+
+    total_spent = conn.execute(
+        f"""
+        SELECT COALESCE(SUM(payment_entries.amount_pesewas), 0) AS total
+        FROM payment_entries
+        INNER JOIN payment_sheets ON payment_sheets.id = payment_entries.sheet_id
+        WHERE payment_sheets.status = 'posted'
+        AND payment_entries.source = 'petty_cash'
+        {exclude_clause}
+        """,
+        params,
+    ).fetchone()["total"]
+
+    balance = total_withdrawn - total_spent
+
+    return {
+        "total_withdrawn": total_withdrawn,
+        "total_spent": total_spent,
+        "balance": balance,
+    }
+
+
+def get_petty_cash_balance_pesewas(
+    conn: sqlite3.Connection,
+    exclude_payment_sheet_id: Optional[int] = None,
+) -> int:
+    return get_petty_cash_totals(conn, exclude_payment_sheet_id)["balance"]
+
+
+def serialize_petty_cash_withdrawal(row: sqlite3.Row):
+    return {
+        "id": row["id"],
+        "bank_id": row["bank_id"],
+        "bank_name": row["bank_name"],
+        "amount": pesewas_to_money(row["amount_pesewas"]),
+        "note": row["note"],
+        "created_at": row["created_at"],
+    }
+
+
+def ensure_payment_entries_schema(conn: sqlite3.Connection):
+    existing_table = conn.execute(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table' AND name = 'payment_entries'
+        """
+    ).fetchone()
+
+    if not existing_table:
+        return
+
+    columns = conn.execute("PRAGMA table_info(payment_entries)").fetchall()
+    column_map = {column["name"]: column for column in columns}
+    column_names = set(column_map.keys())
+
+    bank_id_is_not_null = bool(column_map.get("bank_id") and column_map["bank_id"]["notnull"] == 1)
+    source_missing = "source" not in column_names
+
+    if not bank_id_is_not_null and not source_missing:
+        return
+
+    source_expression = "source" if "source" in column_names else "'bank'"
+
+    conn.execute("ALTER TABLE payment_entries RENAME TO payment_entries_old")
+
+    conn.execute(
+        """
+        CREATE TABLE payment_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sheet_id INTEGER NOT NULL,
+            category TEXT NOT NULL,
+            subcategory TEXT NOT NULL,
+            amount_pesewas INTEGER NOT NULL CHECK(amount_pesewas > 0),
+            bank_id INTEGER,
+            source TEXT NOT NULL DEFAULT 'bank',
+            note TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(sheet_id) REFERENCES payment_sheets(id) ON DELETE CASCADE,
+            FOREIGN KEY(bank_id) REFERENCES banks(id)
+        )
+        """
+    )
+
+    conn.execute(
+        f"""
+        INSERT INTO payment_entries (
+            id,
+            sheet_id,
+            category,
+            subcategory,
+            amount_pesewas,
+            bank_id,
+            source,
+            note,
+            created_at,
+            updated_at
+        )
+        SELECT
+            id,
+            sheet_id,
+            category,
+            subcategory,
+            amount_pesewas,
+            bank_id,
+            {source_expression},
+            note,
+            created_at,
+            updated_at
+        FROM payment_entries_old
+        """
+    )
+
+    conn.execute("DROP TABLE payment_entries_old")
 
 
 def replace_receipt_entries(
@@ -428,7 +631,8 @@ def init_db():
                 category TEXT NOT NULL,
                 subcategory TEXT NOT NULL,
                 amount_pesewas INTEGER NOT NULL CHECK(amount_pesewas > 0),
-                bank_id INTEGER NOT NULL,
+                bank_id INTEGER,
+                source TEXT NOT NULL DEFAULT 'bank',
                 note TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -437,6 +641,21 @@ def init_db():
             )
             """
         )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS petty_cash_withdrawals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bank_id INTEGER NOT NULL,
+                amount_pesewas INTEGER NOT NULL CHECK(amount_pesewas > 0),
+                note TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(bank_id) REFERENCES banks(id)
+            )
+            """
+        )
+
+        ensure_payment_entries_schema(conn)
         
 
         for bank_name in ["NIB", "CBG", "Zenith"]:
@@ -505,7 +724,8 @@ class PaymentEntryPayload(BaseModel):
     category: str = Field(min_length=2)
     subcategory: str = Field(min_length=1)
     amount: Decimal = Field(gt=0)
-    bank_id: int
+    bank_id: Optional[int] = None
+    source: str = Field(default="bank")
     note: Optional[str] = None
 
 
@@ -518,6 +738,11 @@ class PaymentDraftPayload(BaseModel):
 class PaymentPostedUpdatePayload(BaseModel):
     title: str = Field(min_length=2)
     entries: List[PaymentEntryPayload] = Field(default_factory=list)
+
+class PettyCashWithdrawalCreate(BaseModel):
+    bank_id: int
+    amount: Decimal = Field(gt=0)
+    note: Optional[str] = None
 @app.get("/api/health")
 def health_check():
     return {
@@ -1001,6 +1226,141 @@ def delete_receipt_sheet(sheet_id: int):
 
     return {"ok": True, "message": "Receipt sheet deleted successfully."}
 
+@app.get("/api/petty-cash/summary")
+def get_petty_cash_summary():
+    with get_connection() as conn:
+        totals = get_petty_cash_totals(conn)
+
+    return {
+        "balance": pesewas_to_money(totals["balance"]),
+        "total_withdrawn": pesewas_to_money(totals["total_withdrawn"]),
+        "total_spent": pesewas_to_money(totals["total_spent"]),
+    }
+
+
+@app.get("/api/petty-cash/withdrawals")
+def get_petty_cash_withdrawals():
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                petty_cash_withdrawals.id,
+                petty_cash_withdrawals.bank_id,
+                banks.name AS bank_name,
+                petty_cash_withdrawals.amount_pesewas,
+                petty_cash_withdrawals.note,
+                petty_cash_withdrawals.created_at
+            FROM petty_cash_withdrawals
+            INNER JOIN banks ON banks.id = petty_cash_withdrawals.bank_id
+            ORDER BY petty_cash_withdrawals.created_at DESC, petty_cash_withdrawals.id DESC
+            """
+        ).fetchall()
+
+    return [serialize_petty_cash_withdrawal(row) for row in rows]
+
+
+@app.post("/api/petty-cash/withdrawals")
+def create_petty_cash_withdrawal(payload: PettyCashWithdrawalCreate):
+    amount_pesewas = money_to_pesewas(payload.amount)
+    note = clean_optional_text(payload.note)
+
+    with get_connection() as conn:
+        bank = validate_bank_exists(conn, payload.bank_id)
+
+        if bank["balance_pesewas"] - amount_pesewas < 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{bank['name']} does not have enough balance for this petty cash withdrawal.",
+            )
+
+        conn.execute(
+            """
+            UPDATE banks
+            SET balance_pesewas = balance_pesewas - ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (amount_pesewas, payload.bank_id),
+        )
+
+        cursor = conn.execute(
+            """
+            INSERT INTO petty_cash_withdrawals (
+                bank_id,
+                amount_pesewas,
+                note
+            )
+            VALUES (?, ?, ?)
+            """,
+            (payload.bank_id, amount_pesewas, note),
+        )
+
+        conn.commit()
+
+        row = conn.execute(
+            """
+            SELECT
+                petty_cash_withdrawals.id,
+                petty_cash_withdrawals.bank_id,
+                banks.name AS bank_name,
+                petty_cash_withdrawals.amount_pesewas,
+                petty_cash_withdrawals.note,
+                petty_cash_withdrawals.created_at
+            FROM petty_cash_withdrawals
+            INNER JOIN banks ON banks.id = petty_cash_withdrawals.bank_id
+            WHERE petty_cash_withdrawals.id = ?
+            """,
+            (cursor.lastrowid,),
+        ).fetchone()
+
+    return serialize_petty_cash_withdrawal(row)
+
+
+@app.delete("/api/petty-cash/withdrawals/{withdrawal_id}")
+def delete_petty_cash_withdrawal(withdrawal_id: int):
+    with get_connection() as conn:
+        withdrawal = conn.execute(
+            """
+            SELECT id, bank_id, amount_pesewas
+            FROM petty_cash_withdrawals
+            WHERE id = ?
+            """,
+            (withdrawal_id,),
+        ).fetchone()
+
+        if not withdrawal:
+            raise HTTPException(status_code=404, detail="Petty cash withdrawal not found.")
+
+        current_balance = get_petty_cash_balance_pesewas(conn)
+
+        if current_balance - withdrawal["amount_pesewas"] < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot delete this withdrawal because some of the petty cash has already been spent.",
+            )
+
+        conn.execute(
+            """
+            UPDATE banks
+            SET balance_pesewas = balance_pesewas + ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (withdrawal["amount_pesewas"], withdrawal["bank_id"]),
+        )
+
+        conn.execute(
+            """
+            DELETE FROM petty_cash_withdrawals
+            WHERE id = ?
+            """,
+            (withdrawal_id,),
+        )
+
+        conn.commit()
+
+    return {"ok": True, "message": "Petty cash withdrawal deleted successfully."}
+
 @app.get("/api/payment-sheets")
 def get_payment_sheets():
     with get_connection() as conn:
@@ -1119,7 +1479,7 @@ def post_payment_sheet(sheet_id: int):
 
         entries = conn.execute(
             """
-            SELECT id, bank_id, amount_pesewas
+            SELECT id, bank_id, amount_pesewas, source
             FROM payment_entries
             WHERE sheet_id = ?
             """,
@@ -1132,7 +1492,8 @@ def post_payment_sheet(sheet_id: int):
                 detail="Cannot post an empty payment sheet.",
             )
 
-        bank_groups = group_amounts_by_bank(entries)
+        bank_groups = group_bank_payment_amounts(entries)
+        petty_cash_total = sum_petty_cash_entries(entries)
 
         for bank_id, amount_pesewas in bank_groups.items():
             bank = validate_bank_exists(conn, bank_id)
@@ -1142,6 +1503,14 @@ def post_payment_sheet(sheet_id: int):
                     status_code=400,
                     detail=f"Cannot post payment sheet. {bank['name']} does not have enough balance.",
                 )
+
+        petty_cash_balance = get_petty_cash_balance_pesewas(conn)
+
+        if petty_cash_balance - petty_cash_total < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot post payment sheet. Petty cash balance is not enough.",
+            )
 
         for bank_id, amount_pesewas in bank_groups.items():
             conn.execute(
@@ -1198,14 +1567,14 @@ def update_posted_payment_sheet(sheet_id: int, payload: PaymentPostedUpdatePaylo
 
         old_entries = conn.execute(
             """
-            SELECT id, bank_id, amount_pesewas
+            SELECT id, bank_id, amount_pesewas, source
             FROM payment_entries
             WHERE sheet_id = ?
             """,
             (sheet_id,),
         ).fetchall()
 
-        old_bank_groups = group_amounts_by_bank(old_entries)
+        old_bank_groups = group_bank_payment_amounts(old_entries)
 
         # Reverse old payment deductions by adding money back to banks.
         for bank_id, amount_pesewas in old_bank_groups.items():
@@ -1243,7 +1612,18 @@ def update_posted_payment_sheet(sheet_id: int, payload: PaymentPostedUpdatePaylo
             (sheet_id,),
         ).fetchall()
 
-        new_bank_groups = group_amounts_by_bank(new_entries)
+        new_bank_groups = group_bank_payment_amounts(new_entries)
+        new_petty_cash_total = sum_petty_cash_entries(new_entries)
+        available_petty_cash = get_petty_cash_balance_pesewas(
+            conn,
+            exclude_payment_sheet_id=sheet_id,
+        )
+
+        if available_petty_cash - new_petty_cash_total < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="This edit cannot be saved. Petty cash balance is not enough.",
+            )
 
         # Check balances before applying new deductions.
         for bank_id, amount_pesewas in new_bank_groups.items():
@@ -1288,7 +1668,7 @@ def delete_payment_sheet(sheet_id: int):
 
         entries = conn.execute(
             """
-            SELECT id, bank_id, amount_pesewas
+            SELECT id, bank_id, amount_pesewas, source
             FROM payment_entries
             WHERE sheet_id = ?
             """,
@@ -1296,7 +1676,7 @@ def delete_payment_sheet(sheet_id: int):
         ).fetchall()
 
         if sheet["status"] == "posted":
-            bank_groups = group_amounts_by_bank(entries)
+            bank_groups = group_bank_payment_amounts(entries)
 
             # Deleting a posted payment reverses the deduction by adding money back.
             for bank_id, amount_pesewas in bank_groups.items():
@@ -1366,6 +1746,6 @@ def dashboard_summary():
         "total_balance": pesewas_to_money(bank_summary["total_balance"]),
         "receipts_total": pesewas_to_money(receipts_total),
         "payments_total": pesewas_to_money(payments_total),
-        "petty_cash_balance": 0,
+        "petty_cash_balance": pesewas_to_money(get_petty_cash_balance_pesewas(conn)),
         "savings_total": 0,
     }
