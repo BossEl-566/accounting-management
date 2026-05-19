@@ -1,8 +1,9 @@
 from contextlib import asynccontextmanager
+from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 import sqlite3
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,6 +33,14 @@ def pesewas_to_money(amount_pesewas: int) -> float:
     return amount_pesewas / 100
 
 
+def clean_optional_text(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+
+    cleaned = value.strip()
+    return cleaned if cleaned else None
+
+
 def serialize_bank(row: sqlite3.Row):
     return {
         "id": row["id"],
@@ -42,19 +51,163 @@ def serialize_bank(row: sqlite3.Row):
     }
 
 
-def serialize_transaction(row: sqlite3.Row):
+def serialize_receipt_entry(row: sqlite3.Row):
     return {
         "id": row["id"],
-        "transaction_type": row["transaction_type"],
+        "sheet_id": row["sheet_id"],
         "category": row["category"],
         "subcategory": row["subcategory"],
         "amount": pesewas_to_money(row["amount_pesewas"]),
         "bank_id": row["bank_id"],
         "bank_name": row["bank_name"],
-        "source": row["source"],
         "note": row["note"],
         "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
     }
+
+
+def serialize_receipt_sheet(row: sqlite3.Row):
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "sheet_date": row["sheet_date"],
+        "status": row["status"],
+        "total_amount": pesewas_to_money(row["total_pesewas"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "posted_at": row["posted_at"],
+    }
+
+
+def get_receipt_sheet_detail(conn: sqlite3.Connection, sheet_id: int):
+    sheet = conn.execute(
+        """
+        SELECT id, title, sheet_date, status, total_pesewas, created_at, updated_at, posted_at
+        FROM receipt_sheets
+        WHERE id = ?
+        """,
+        (sheet_id,),
+    ).fetchone()
+
+    if not sheet:
+        raise HTTPException(status_code=404, detail="Receipt sheet not found.")
+
+    entries = conn.execute(
+        """
+        SELECT
+            receipt_entries.id,
+            receipt_entries.sheet_id,
+            receipt_entries.category,
+            receipt_entries.subcategory,
+            receipt_entries.amount_pesewas,
+            receipt_entries.bank_id,
+            banks.name AS bank_name,
+            receipt_entries.note,
+            receipt_entries.created_at,
+            receipt_entries.updated_at
+        FROM receipt_entries
+        LEFT JOIN banks ON banks.id = receipt_entries.bank_id
+        WHERE receipt_entries.sheet_id = ?
+        ORDER BY receipt_entries.id ASC
+        """,
+        (sheet_id,),
+    ).fetchall()
+
+    data = serialize_receipt_sheet(sheet)
+    data["entries"] = [serialize_receipt_entry(entry) for entry in entries]
+    return data
+
+
+def group_amounts_by_bank(entries: List[sqlite3.Row]):
+    grouped = {}
+
+    for entry in entries:
+        bank_id = entry["bank_id"]
+        grouped[bank_id] = grouped.get(bank_id, 0) + entry["amount_pesewas"]
+
+    return grouped
+
+
+def validate_bank_exists(conn: sqlite3.Connection, bank_id: int):
+    bank = conn.execute(
+        """
+        SELECT id, name, balance_pesewas
+        FROM banks
+        WHERE id = ?
+        """,
+        (bank_id,),
+    ).fetchone()
+
+    if not bank:
+        raise HTTPException(status_code=404, detail="Selected bank was not found.")
+
+    return bank
+
+
+def replace_receipt_entries(
+    conn: sqlite3.Connection,
+    sheet_id: int,
+    entries: list,
+) -> int:
+    total_pesewas = 0
+
+    conn.execute(
+        """
+        DELETE FROM receipt_entries
+        WHERE sheet_id = ?
+        """,
+        (sheet_id,),
+    )
+
+    for entry in entries:
+        category = entry.category.strip()
+        subcategory = entry.subcategory.strip()
+        note = clean_optional_text(entry.note)
+        amount_pesewas = money_to_pesewas(entry.amount)
+
+        if not category:
+            raise HTTPException(status_code=400, detail="Receipt category is required.")
+
+        if not subcategory:
+            raise HTTPException(status_code=400, detail="Receipt name is required.")
+
+        validate_bank_exists(conn, entry.bank_id)
+
+        conn.execute(
+            """
+            INSERT INTO receipt_entries (
+                sheet_id,
+                category,
+                subcategory,
+                amount_pesewas,
+                bank_id,
+                note
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                sheet_id,
+                category,
+                subcategory,
+                amount_pesewas,
+                entry.bank_id,
+                note,
+            ),
+        )
+
+        total_pesewas += amount_pesewas
+
+    conn.execute(
+        """
+        UPDATE receipt_sheets
+        SET total_pesewas = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (total_pesewas, sheet_id),
+    )
+
+    return total_pesewas
 
 
 def init_db():
@@ -85,6 +238,39 @@ def init_db():
                 source TEXT NOT NULL DEFAULT 'bank',
                 note TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(bank_id) REFERENCES banks(id)
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS receipt_sheets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                sheet_date TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'draft',
+                total_pesewas INTEGER NOT NULL DEFAULT 0 CHECK(total_pesewas >= 0),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                posted_at TEXT
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS receipt_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sheet_id INTEGER NOT NULL,
+                category TEXT NOT NULL,
+                subcategory TEXT NOT NULL,
+                amount_pesewas INTEGER NOT NULL CHECK(amount_pesewas > 0),
+                bank_id INTEGER NOT NULL,
+                note TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(sheet_id) REFERENCES receipt_sheets(id) ON DELETE CASCADE,
                 FOREIGN KEY(bank_id) REFERENCES banks(id)
             )
             """
@@ -134,20 +320,23 @@ class BankUpdate(BaseModel):
     balance: Optional[Decimal] = Field(default=None, ge=0)
 
 
-class ReceiptCreate(BaseModel):
+class ReceiptEntryPayload(BaseModel):
     category: str = Field(min_length=2)
-    subcategory: Optional[str] = None
+    subcategory: str = Field(min_length=1)
     amount: Decimal = Field(gt=0)
     bank_id: int
     note: Optional[str] = None
 
 
-class ReceiptUpdate(BaseModel):
-    category: str = Field(min_length=2)
-    subcategory: Optional[str] = None
-    amount: Decimal = Field(gt=0)
-    bank_id: int
-    note: Optional[str] = None
+class ReceiptDraftPayload(BaseModel):
+    sheet_id: Optional[int] = None
+    title: str = Field(min_length=2)
+    entries: List[ReceiptEntryPayload] = Field(default_factory=list)
+
+
+class ReceiptPostedUpdatePayload(BaseModel):
+    title: str = Field(min_length=2)
+    entries: List[ReceiptEntryPayload] = Field(default_factory=list)
 
 
 @app.get("/api/health")
@@ -281,10 +470,19 @@ def delete_bank(bank_id: int):
             (bank_id,),
         ).fetchone()["total"]
 
-        if transaction_count > 0:
+        receipt_entry_count = conn.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM receipt_entries
+            WHERE bank_id = ?
+            """,
+            (bank_id,),
+        ).fetchone()["total"]
+
+        if transaction_count > 0 or receipt_entry_count > 0:
             raise HTTPException(
                 status_code=400,
-                detail="This bank has transactions and cannot be deleted.",
+                detail="This bank has records and cannot be deleted.",
             )
 
         conn.execute("DELETE FROM banks WHERE id = ?", (bank_id,))
@@ -293,200 +491,139 @@ def delete_bank(bank_id: int):
     return {"ok": True, "message": "Bank deleted successfully."}
 
 
-@app.get("/api/receipts")
-def get_receipts():
+@app.get("/api/receipt-sheets")
+def get_receipt_sheets():
     with get_connection() as conn:
         rows = conn.execute(
             """
-            SELECT
-                transactions.id,
-                transactions.transaction_type,
-                transactions.category,
-                transactions.subcategory,
-                transactions.amount_pesewas,
-                transactions.bank_id,
-                banks.name AS bank_name,
-                transactions.source,
-                transactions.note,
-                transactions.created_at
-            FROM transactions
-            LEFT JOIN banks ON banks.id = transactions.bank_id
-            WHERE transactions.transaction_type = 'receipt'
-            ORDER BY transactions.created_at DESC, transactions.id DESC
+            SELECT id, title, sheet_date, status, total_pesewas, created_at, updated_at, posted_at
+            FROM receipt_sheets
+            ORDER BY sheet_date DESC, id DESC
             """
         ).fetchall()
 
-    return [serialize_transaction(row) for row in rows]
+    return [serialize_receipt_sheet(row) for row in rows]
 
 
-@app.post("/api/receipts")
-def create_receipt(payload: ReceiptCreate):
-    category = payload.category.strip()
-    subcategory = payload.subcategory.strip() if payload.subcategory else None
-    note = payload.note.strip() if payload.note else None
-    amount_pesewas = money_to_pesewas(payload.amount)
-
-    if not category:
-        raise HTTPException(status_code=400, detail="Receipt category is required.")
-
+@app.get("/api/receipt-sheets/draft")
+def get_latest_receipt_draft():
     with get_connection() as conn:
-        bank = conn.execute(
+        draft = conn.execute(
             """
-            SELECT id, balance_pesewas
-            FROM banks
-            WHERE id = ?
-            """,
-            (payload.bank_id,),
+            SELECT id
+            FROM receipt_sheets
+            WHERE status = 'draft'
+            ORDER BY id DESC
+            LIMIT 1
+            """
         ).fetchone()
 
-        if not bank:
-            raise HTTPException(status_code=404, detail="Selected bank was not found.")
+        if not draft:
+            return None
 
-        cursor = conn.execute(
-            """
-            INSERT INTO transactions (
-                transaction_type,
-                category,
-                subcategory,
-                amount_pesewas,
-                bank_id,
-                source,
-                note
+        return get_receipt_sheet_detail(conn, draft["id"])
+
+
+@app.post("/api/receipt-sheets/draft")
+def save_receipt_draft(payload: ReceiptDraftPayload):
+    title = payload.title.strip()
+
+    if not title:
+        raise HTTPException(status_code=400, detail="Receipt sheet title is required.")
+
+    with get_connection() as conn:
+        if payload.sheet_id:
+            sheet = conn.execute(
+                """
+                SELECT id, status
+                FROM receipt_sheets
+                WHERE id = ?
+                """,
+                (payload.sheet_id,),
+            ).fetchone()
+
+            if not sheet:
+                raise HTTPException(status_code=404, detail="Receipt sheet not found.")
+
+            if sheet["status"] != "draft":
+                raise HTTPException(
+                    status_code=400,
+                    detail="Only draft receipt sheets can be auto-saved.",
+                )
+
+            sheet_id = payload.sheet_id
+
+            conn.execute(
+                """
+                UPDATE receipt_sheets
+                SET title = ?,
+                    sheet_date = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (title, date.today().isoformat(), sheet_id),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "receipt",
-                category,
-                subcategory,
-                amount_pesewas,
-                payload.bank_id,
-                "bank",
-                note,
-            ),
-        )
+        else:
+            cursor = conn.execute(
+                """
+                INSERT INTO receipt_sheets (title, sheet_date, status, total_pesewas)
+                VALUES (?, ?, 'draft', 0)
+                """,
+                (title, date.today().isoformat()),
+            )
+            sheet_id = cursor.lastrowid
 
-        conn.execute(
-            """
-            UPDATE banks
-            SET balance_pesewas = balance_pesewas + ?,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-            """,
-            (amount_pesewas, payload.bank_id),
-        )
+        replace_receipt_entries(conn, sheet_id, payload.entries)
 
         conn.commit()
 
-        row = conn.execute(
-            """
-            SELECT
-                transactions.id,
-                transactions.transaction_type,
-                transactions.category,
-                transactions.subcategory,
-                transactions.amount_pesewas,
-                transactions.bank_id,
-                banks.name AS bank_name,
-                transactions.source,
-                transactions.note,
-                transactions.created_at
-            FROM transactions
-            LEFT JOIN banks ON banks.id = transactions.bank_id
-            WHERE transactions.id = ?
-            """,
-            (cursor.lastrowid,),
-        ).fetchone()
-
-    return serialize_transaction(row)
+        return get_receipt_sheet_detail(conn, sheet_id)
 
 
-@app.patch("/api/receipts/{receipt_id}")
-def update_receipt(receipt_id: int, payload: ReceiptUpdate):
-    category = payload.category.strip()
-    subcategory = payload.subcategory.strip() if payload.subcategory else None
-    note = payload.note.strip() if payload.note else None
-    new_amount_pesewas = money_to_pesewas(payload.amount)
-
-    if not category:
-        raise HTTPException(status_code=400, detail="Receipt category is required.")
-
+@app.get("/api/receipt-sheets/{sheet_id}")
+def get_receipt_sheet(sheet_id: int):
     with get_connection() as conn:
-        existing = conn.execute(
-            """
-            SELECT id, amount_pesewas, bank_id
-            FROM transactions
-            WHERE id = ? AND transaction_type = 'receipt'
-            """,
-            (receipt_id,),
-        ).fetchone()
+        return get_receipt_sheet_detail(conn, sheet_id)
 
-        if not existing:
-            raise HTTPException(status_code=404, detail="Receipt not found.")
 
-        old_bank = conn.execute(
+@app.post("/api/receipt-sheets/{sheet_id}/post")
+def post_receipt_sheet(sheet_id: int):
+    with get_connection() as conn:
+        sheet = conn.execute(
             """
-            SELECT id, balance_pesewas
-            FROM banks
+            SELECT id, status
+            FROM receipt_sheets
             WHERE id = ?
             """,
-            (existing["bank_id"],),
+            (sheet_id,),
         ).fetchone()
 
-        new_bank = conn.execute(
+        if not sheet:
+            raise HTTPException(status_code=404, detail="Receipt sheet not found.")
+
+        if sheet["status"] == "posted":
+            raise HTTPException(
+                status_code=400,
+                detail="This receipt sheet has already been posted.",
+            )
+
+        entries = conn.execute(
             """
-            SELECT id, balance_pesewas
-            FROM banks
-            WHERE id = ?
+            SELECT id, bank_id, amount_pesewas
+            FROM receipt_entries
+            WHERE sheet_id = ?
             """,
-            (payload.bank_id,),
-        ).fetchone()
+            (sheet_id,),
+        ).fetchall()
 
-        if not new_bank:
-            raise HTTPException(status_code=404, detail="Selected bank was not found.")
-
-        old_amount_pesewas = existing["amount_pesewas"]
-        old_bank_id = existing["bank_id"]
-        new_bank_id = payload.bank_id
-
-        if old_bank_id == new_bank_id:
-            corrected_balance = (
-                old_bank["balance_pesewas"] - old_amount_pesewas + new_amount_pesewas
+        if len(entries) == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot post an empty receipt sheet.",
             )
 
-            if corrected_balance < 0:
-                raise HTTPException(
-                    status_code=400,
-                    detail="This edit would make the selected bank balance negative.",
-                )
-
-            conn.execute(
-                """
-                UPDATE banks
-                SET balance_pesewas = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (corrected_balance, old_bank_id),
-            )
-        else:
-            old_bank_after_reversal = old_bank["balance_pesewas"] - old_amount_pesewas
-
-            if old_bank_after_reversal < 0:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Cannot move this receipt because reversing it would make the old bank negative.",
-                )
-
-            conn.execute(
-                """
-                UPDATE banks
-                SET balance_pesewas = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (old_bank_after_reversal, old_bank_id),
-            )
+        for entry in entries:
+            validate_bank_exists(conn, entry["bank_id"])
 
             conn.execute(
                 """
@@ -495,110 +632,186 @@ def update_receipt(receipt_id: int, payload: ReceiptUpdate):
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (new_amount_pesewas, new_bank_id),
+                (entry["amount_pesewas"], entry["bank_id"]),
             )
 
         conn.execute(
             """
-            UPDATE transactions
-            SET category = ?,
-                subcategory = ?,
-                amount_pesewas = ?,
-                bank_id = ?,
-                note = ?
-            WHERE id = ? AND transaction_type = 'receipt'
-            """,
-            (
-                category,
-                subcategory,
-                new_amount_pesewas,
-                new_bank_id,
-                note,
-                receipt_id,
-            ),
-        )
-
-        conn.commit()
-
-        row = conn.execute(
-            """
-            SELECT
-                transactions.id,
-                transactions.transaction_type,
-                transactions.category,
-                transactions.subcategory,
-                transactions.amount_pesewas,
-                transactions.bank_id,
-                banks.name AS bank_name,
-                transactions.source,
-                transactions.note,
-                transactions.created_at
-            FROM transactions
-            LEFT JOIN banks ON banks.id = transactions.bank_id
-            WHERE transactions.id = ?
-            """,
-            (receipt_id,),
-        ).fetchone()
-
-    return serialize_transaction(row)
-
-
-@app.delete("/api/receipts/{receipt_id}")
-def delete_receipt(receipt_id: int):
-    with get_connection() as conn:
-        existing = conn.execute(
-            """
-            SELECT id, amount_pesewas, bank_id
-            FROM transactions
-            WHERE id = ? AND transaction_type = 'receipt'
-            """,
-            (receipt_id,),
-        ).fetchone()
-
-        if not existing:
-            raise HTTPException(status_code=404, detail="Receipt not found.")
-
-        bank = conn.execute(
-            """
-            SELECT id, balance_pesewas
-            FROM banks
-            WHERE id = ?
-            """,
-            (existing["bank_id"],),
-        ).fetchone()
-
-        if not bank:
-            raise HTTPException(status_code=404, detail="Receipt bank was not found.")
-
-        new_balance = bank["balance_pesewas"] - existing["amount_pesewas"]
-
-        if new_balance < 0:
-            raise HTTPException(
-                status_code=400,
-                detail="Cannot delete this receipt because it would make the bank balance negative.",
-            )
-
-        conn.execute(
-            """
-            UPDATE banks
-            SET balance_pesewas = ?,
+            UPDATE receipt_sheets
+            SET status = 'posted',
+                posted_at = CURRENT_TIMESTAMP,
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
-            (new_balance, existing["bank_id"]),
-        )
-
-        conn.execute(
-            """
-            DELETE FROM transactions
-            WHERE id = ? AND transaction_type = 'receipt'
-            """,
-            (receipt_id,),
+            (sheet_id,),
         )
 
         conn.commit()
 
-    return {"ok": True, "message": "Receipt deleted successfully."}
+        return get_receipt_sheet_detail(conn, sheet_id)
+
+
+@app.patch("/api/receipt-sheets/{sheet_id}")
+def update_posted_receipt_sheet(sheet_id: int, payload: ReceiptPostedUpdatePayload):
+    title = payload.title.strip()
+
+    if not title:
+        raise HTTPException(status_code=400, detail="Receipt sheet title is required.")
+
+    with get_connection() as conn:
+        sheet = conn.execute(
+            """
+            SELECT id, status
+            FROM receipt_sheets
+            WHERE id = ?
+            """,
+            (sheet_id,),
+        ).fetchone()
+
+        if not sheet:
+            raise HTTPException(status_code=404, detail="Receipt sheet not found.")
+
+        if sheet["status"] != "posted":
+            raise HTTPException(
+                status_code=400,
+                detail="Only posted sheets should be updated here. Drafts auto-save separately.",
+            )
+
+        old_entries = conn.execute(
+            """
+            SELECT id, bank_id, amount_pesewas
+            FROM receipt_entries
+            WHERE sheet_id = ?
+            """,
+            (sheet_id,),
+        ).fetchall()
+
+        old_bank_groups = group_amounts_by_bank(old_entries)
+
+        for bank_id, amount_pesewas in old_bank_groups.items():
+            bank = validate_bank_exists(conn, bank_id)
+
+            if bank["balance_pesewas"] - amount_pesewas < 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="This edit cannot be completed because reversing the old receipt would make a bank balance negative.",
+                )
+
+        for bank_id, amount_pesewas in old_bank_groups.items():
+            conn.execute(
+                """
+                UPDATE banks
+                SET balance_pesewas = balance_pesewas - ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (amount_pesewas, bank_id),
+            )
+
+        conn.execute(
+            """
+            UPDATE receipt_sheets
+            SET title = ?,
+                sheet_date = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (title, date.today().isoformat(), sheet_id),
+        )
+
+        replace_receipt_entries(conn, sheet_id, payload.entries)
+
+        new_entries = conn.execute(
+            """
+            SELECT id, bank_id, amount_pesewas
+            FROM receipt_entries
+            WHERE sheet_id = ?
+            """,
+            (sheet_id,),
+        ).fetchall()
+
+        for entry in new_entries:
+            conn.execute(
+                """
+                UPDATE banks
+                SET balance_pesewas = balance_pesewas + ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (entry["amount_pesewas"], entry["bank_id"]),
+            )
+
+        conn.commit()
+
+        return get_receipt_sheet_detail(conn, sheet_id)
+
+
+@app.delete("/api/receipt-sheets/{sheet_id}")
+def delete_receipt_sheet(sheet_id: int):
+    with get_connection() as conn:
+        sheet = conn.execute(
+            """
+            SELECT id, status
+            FROM receipt_sheets
+            WHERE id = ?
+            """,
+            (sheet_id,),
+        ).fetchone()
+
+        if not sheet:
+            raise HTTPException(status_code=404, detail="Receipt sheet not found.")
+
+        entries = conn.execute(
+            """
+            SELECT id, bank_id, amount_pesewas
+            FROM receipt_entries
+            WHERE sheet_id = ?
+            """,
+            (sheet_id,),
+        ).fetchall()
+
+        if sheet["status"] == "posted":
+            bank_groups = group_amounts_by_bank(entries)
+
+            for bank_id, amount_pesewas in bank_groups.items():
+                bank = validate_bank_exists(conn, bank_id)
+
+                if bank["balance_pesewas"] - amount_pesewas < 0:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Cannot delete this sheet because reversing it would make a bank balance negative.",
+                    )
+
+            for bank_id, amount_pesewas in bank_groups.items():
+                conn.execute(
+                    """
+                    UPDATE banks
+                    SET balance_pesewas = balance_pesewas - ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (amount_pesewas, bank_id),
+                )
+
+        conn.execute(
+            """
+            DELETE FROM receipt_entries
+            WHERE sheet_id = ?
+            """,
+            (sheet_id,),
+        )
+
+        conn.execute(
+            """
+            DELETE FROM receipt_sheets
+            WHERE id = ?
+            """,
+            (sheet_id,),
+        )
+
+        conn.commit()
+
+    return {"ok": True, "message": "Receipt sheet deleted successfully."}
 
 
 @app.get("/api/dashboard/summary")
@@ -615,9 +828,9 @@ def dashboard_summary():
 
         receipts_total = conn.execute(
             """
-            SELECT COALESCE(SUM(amount_pesewas), 0) AS total
-            FROM transactions
-            WHERE transaction_type = 'receipt'
+            SELECT COALESCE(SUM(total_pesewas), 0) AS total
+            FROM receipt_sheets
+            WHERE status = 'posted'
             """
         ).fetchone()["total"]
 

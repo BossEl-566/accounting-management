@@ -8,17 +8,40 @@ export type Bank = {
   updated_at: string;
 };
 
-export type Transaction = {
-  id: number;
-  transaction_type: "receipt" | "payment";
+export type ReceiptEntryInput = {
   category: string;
-  subcategory: string | null;
+  subcategory: string;
   amount: number;
-  bank_id: number | null;
+  bank_id: number;
+  note?: string | null;
+};
+
+export type ReceiptEntry = {
+  id: number;
+  sheet_id: number;
+  category: string;
+  subcategory: string;
+  amount: number;
+  bank_id: number;
   bank_name: string | null;
-  source: string;
   note: string | null;
   created_at: string;
+  updated_at: string;
+};
+
+export type ReceiptSheet = {
+  id: number;
+  title: string;
+  sheet_date: string;
+  status: "draft" | "posted";
+  total_amount: number;
+  created_at: string;
+  updated_at: string;
+  posted_at: string | null;
+};
+
+export type ReceiptSheetDetail = ReceiptSheet & {
+  entries: ReceiptEntry[];
 };
 
 export type DashboardSummary = {
@@ -88,22 +111,38 @@ export async function deleteBank(id: number): Promise<{ ok: boolean }> {
   return handleResponse<{ ok: boolean }>(response);
 }
 
-export async function getReceipts(): Promise<Transaction[]> {
-  const response = await fetch(`${API_BASE_URL}/receipts`, {
+export async function getReceiptSheets(): Promise<ReceiptSheet[]> {
+  const response = await fetch(`${API_BASE_URL}/receipt-sheets`, {
     cache: "no-store",
   });
 
-  return handleResponse<Transaction[]>(response);
+  return handleResponse<ReceiptSheet[]>(response);
 }
 
-export async function createReceipt(payload: {
-  category: string;
-  subcategory?: string | null;
-  amount: number;
-  bank_id: number;
-  note?: string | null;
-}): Promise<Transaction> {
-  const response = await fetch(`${API_BASE_URL}/receipts`, {
+export async function getReceiptSheet(
+  id: number
+): Promise<ReceiptSheetDetail> {
+  const response = await fetch(`${API_BASE_URL}/receipt-sheets/${id}`, {
+    cache: "no-store",
+  });
+
+  return handleResponse<ReceiptSheetDetail>(response);
+}
+
+export async function getLatestReceiptDraft(): Promise<ReceiptSheetDetail | null> {
+  const response = await fetch(`${API_BASE_URL}/receipt-sheets/draft`, {
+    cache: "no-store",
+  });
+
+  return handleResponse<ReceiptSheetDetail | null>(response);
+}
+
+export async function saveReceiptDraft(payload: {
+  sheet_id?: number | null;
+  title: string;
+  entries: ReceiptEntryInput[];
+}): Promise<ReceiptSheetDetail> {
+  const response = await fetch(`${API_BASE_URL}/receipt-sheets/draft`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -111,20 +150,27 @@ export async function createReceipt(payload: {
     body: JSON.stringify(payload),
   });
 
-  return handleResponse<Transaction>(response);
+  return handleResponse<ReceiptSheetDetail>(response);
 }
 
-export async function updateReceipt(
+export async function postReceiptSheet(
+  id: number
+): Promise<ReceiptSheetDetail> {
+  const response = await fetch(`${API_BASE_URL}/receipt-sheets/${id}/post`, {
+    method: "POST",
+  });
+
+  return handleResponse<ReceiptSheetDetail>(response);
+}
+
+export async function updatePostedReceiptSheet(
   id: number,
   payload: {
-    category: string;
-    subcategory?: string | null;
-    amount: number;
-    bank_id: number;
-    note?: string | null;
+    title: string;
+    entries: ReceiptEntryInput[];
   }
-): Promise<Transaction> {
-  const response = await fetch(`${API_BASE_URL}/receipts/${id}`, {
+): Promise<ReceiptSheetDetail> {
+  const response = await fetch(`${API_BASE_URL}/receipt-sheets/${id}`, {
     method: "PATCH",
     headers: {
       "Content-Type": "application/json",
@@ -132,11 +178,13 @@ export async function updateReceipt(
     body: JSON.stringify(payload),
   });
 
-  return handleResponse<Transaction>(response);
+  return handleResponse<ReceiptSheetDetail>(response);
 }
 
-export async function deleteReceipt(id: number): Promise<{ ok: boolean }> {
-  const response = await fetch(`${API_BASE_URL}/receipts/${id}`, {
+export async function deleteReceiptSheet(
+  id: number
+): Promise<{ ok: boolean }> {
+  const response = await fetch(`${API_BASE_URL}/receipt-sheets/${id}`, {
     method: "DELETE",
   });
 
