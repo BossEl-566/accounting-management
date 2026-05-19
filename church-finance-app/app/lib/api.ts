@@ -44,6 +44,42 @@ export type ReceiptSheetDetail = ReceiptSheet & {
   entries: ReceiptEntry[];
 };
 
+export type PaymentEntryInput = {
+  category: string;
+  subcategory: string;
+  amount: number;
+  bank_id: number;
+  note?: string | null;
+};
+
+export type PaymentEntry = {
+  id: number;
+  sheet_id: number;
+  category: string;
+  subcategory: string;
+  amount: number;
+  bank_id: number;
+  bank_name: string | null;
+  note: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type PaymentSheet = {
+  id: number;
+  title: string;
+  sheet_date: string;
+  status: "draft" | "posted";
+  total_amount: number;
+  created_at: string;
+  updated_at: string;
+  posted_at: string | null;
+};
+
+export type PaymentSheetDetail = PaymentSheet & {
+  entries: PaymentEntry[];
+};
+
 export type DashboardSummary = {
   bank_count: number;
   total_balance: number;
@@ -185,6 +221,86 @@ export async function deleteReceiptSheet(
   id: number
 ): Promise<{ ok: boolean }> {
   const response = await fetch(`${API_BASE_URL}/receipt-sheets/${id}`, {
+    method: "DELETE",
+  });
+
+  return handleResponse<{ ok: boolean }>(response);
+}
+
+export async function getPaymentSheets(): Promise<PaymentSheet[]> {
+  const response = await fetch(`${API_BASE_URL}/payment-sheets`, {
+    cache: "no-store",
+  });
+
+  return handleResponse<PaymentSheet[]>(response);
+}
+
+export async function getPaymentSheet(
+  id: number
+): Promise<PaymentSheetDetail> {
+  const response = await fetch(`${API_BASE_URL}/payment-sheets/${id}`, {
+    cache: "no-store",
+  });
+
+  return handleResponse<PaymentSheetDetail>(response);
+}
+
+export async function getLatestPaymentDraft(): Promise<PaymentSheetDetail | null> {
+  const response = await fetch(`${API_BASE_URL}/payment-sheets/draft`, {
+    cache: "no-store",
+  });
+
+  return handleResponse<PaymentSheetDetail | null>(response);
+}
+
+export async function savePaymentDraft(payload: {
+  sheet_id?: number | null;
+  title: string;
+  entries: PaymentEntryInput[];
+}): Promise<PaymentSheetDetail> {
+  const response = await fetch(`${API_BASE_URL}/payment-sheets/draft`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  return handleResponse<PaymentSheetDetail>(response);
+}
+
+export async function postPaymentSheet(
+  id: number
+): Promise<PaymentSheetDetail> {
+  const response = await fetch(`${API_BASE_URL}/payment-sheets/${id}/post`, {
+    method: "POST",
+  });
+
+  return handleResponse<PaymentSheetDetail>(response);
+}
+
+export async function updatePostedPaymentSheet(
+  id: number,
+  payload: {
+    title: string;
+    entries: PaymentEntryInput[];
+  }
+): Promise<PaymentSheetDetail> {
+  const response = await fetch(`${API_BASE_URL}/payment-sheets/${id}`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  return handleResponse<PaymentSheetDetail>(response);
+}
+
+export async function deletePaymentSheet(
+  id: number
+): Promise<{ ok: boolean }> {
+  const response = await fetch(`${API_BASE_URL}/payment-sheets/${id}`, {
     method: "DELETE",
   });
 

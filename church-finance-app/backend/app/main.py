@@ -117,7 +117,137 @@ def get_receipt_sheet_detail(conn: sqlite3.Connection, sheet_id: int):
     data["entries"] = [serialize_receipt_entry(entry) for entry in entries]
     return data
 
+def serialize_payment_entry(row: sqlite3.Row):
+    return {
+        "id": row["id"],
+        "sheet_id": row["sheet_id"],
+        "category": row["category"],
+        "subcategory": row["subcategory"],
+        "amount": pesewas_to_money(row["amount_pesewas"]),
+        "bank_id": row["bank_id"],
+        "bank_name": row["bank_name"],
+        "note": row["note"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
 
+
+def serialize_payment_sheet(row: sqlite3.Row):
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "sheet_date": row["sheet_date"],
+        "status": row["status"],
+        "total_amount": pesewas_to_money(row["total_pesewas"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "posted_at": row["posted_at"],
+    }
+
+
+def get_payment_sheet_detail(conn: sqlite3.Connection, sheet_id: int):
+    sheet = conn.execute(
+        """
+        SELECT id, title, sheet_date, status, total_pesewas, created_at, updated_at, posted_at
+        FROM payment_sheets
+        WHERE id = ?
+        """,
+        (sheet_id,),
+    ).fetchone()
+
+    if not sheet:
+        raise HTTPException(status_code=404, detail="Payment sheet not found.")
+
+    entries = conn.execute(
+        """
+        SELECT
+            payment_entries.id,
+            payment_entries.sheet_id,
+            payment_entries.category,
+            payment_entries.subcategory,
+            payment_entries.amount_pesewas,
+            payment_entries.bank_id,
+            banks.name AS bank_name,
+            payment_entries.note,
+            payment_entries.created_at,
+            payment_entries.updated_at
+        FROM payment_entries
+        LEFT JOIN banks ON banks.id = payment_entries.bank_id
+        WHERE payment_entries.sheet_id = ?
+        ORDER BY payment_entries.id ASC
+        """,
+        (sheet_id,),
+    ).fetchall()
+
+    data = serialize_payment_sheet(sheet)
+    data["entries"] = [serialize_payment_entry(entry) for entry in entries]
+    return data
+
+
+def replace_payment_entries(
+    conn: sqlite3.Connection,
+    sheet_id: int,
+    entries: list,
+) -> int:
+    total_pesewas = 0
+
+    conn.execute(
+        """
+        DELETE FROM payment_entries
+        WHERE sheet_id = ?
+        """,
+        (sheet_id,),
+    )
+
+    for entry in entries:
+        category = entry.category.strip()
+        subcategory = entry.subcategory.strip()
+        note = clean_optional_text(entry.note)
+        amount_pesewas = money_to_pesewas(entry.amount)
+
+        if not category:
+            raise HTTPException(status_code=400, detail="Payment category is required.")
+
+        if not subcategory:
+            raise HTTPException(status_code=400, detail="Payment name is required.")
+
+        validate_bank_exists(conn, entry.bank_id)
+
+        conn.execute(
+            """
+            INSERT INTO payment_entries (
+                sheet_id,
+                category,
+                subcategory,
+                amount_pesewas,
+                bank_id,
+                note
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                sheet_id,
+                category,
+                subcategory,
+                amount_pesewas,
+                entry.bank_id,
+                note,
+            ),
+        )
+
+        total_pesewas += amount_pesewas
+
+    conn.execute(
+        """
+        UPDATE payment_sheets
+        SET total_pesewas = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (total_pesewas, sheet_id),
+    )
+
+    return total_pesewas
 def group_amounts_by_bank(entries: List[sqlite3.Row]):
     grouped = {}
 
@@ -275,6 +405,39 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS payment_sheets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                sheet_date TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'draft',
+                total_pesewas INTEGER NOT NULL DEFAULT 0 CHECK(total_pesewas >= 0),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                posted_at TEXT
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS payment_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sheet_id INTEGER NOT NULL,
+                category TEXT NOT NULL,
+                subcategory TEXT NOT NULL,
+                amount_pesewas INTEGER NOT NULL CHECK(amount_pesewas > 0),
+                bank_id INTEGER NOT NULL,
+                note TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(sheet_id) REFERENCES payment_sheets(id) ON DELETE CASCADE,
+                FOREIGN KEY(bank_id) REFERENCES banks(id)
+            )
+            """
+        )
+        
 
         for bank_name in ["NIB", "CBG", "Zenith"]:
             conn.execute(
@@ -338,7 +501,23 @@ class ReceiptPostedUpdatePayload(BaseModel):
     title: str = Field(min_length=2)
     entries: List[ReceiptEntryPayload] = Field(default_factory=list)
 
+class PaymentEntryPayload(BaseModel):
+    category: str = Field(min_length=2)
+    subcategory: str = Field(min_length=1)
+    amount: Decimal = Field(gt=0)
+    bank_id: int
+    note: Optional[str] = None
 
+
+class PaymentDraftPayload(BaseModel):
+    sheet_id: Optional[int] = None
+    title: str = Field(min_length=2)
+    entries: List[PaymentEntryPayload] = Field(default_factory=list)
+
+
+class PaymentPostedUpdatePayload(BaseModel):
+    title: str = Field(min_length=2)
+    entries: List[PaymentEntryPayload] = Field(default_factory=list)
 @app.get("/api/health")
 def health_check():
     return {
@@ -479,7 +658,16 @@ def delete_bank(bank_id: int):
             (bank_id,),
         ).fetchone()["total"]
 
-        if transaction_count > 0 or receipt_entry_count > 0:
+        payment_entry_count = conn.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM payment_entries
+            WHERE bank_id = ?
+            """,
+            (bank_id,),
+        ).fetchone()["total"]
+
+        if transaction_count > 0 or receipt_entry_count > 0 or payment_entry_count > 0:
             raise HTTPException(
                 status_code=400,
                 detail="This bank has records and cannot be deleted.",
@@ -813,6 +1001,337 @@ def delete_receipt_sheet(sheet_id: int):
 
     return {"ok": True, "message": "Receipt sheet deleted successfully."}
 
+@app.get("/api/payment-sheets")
+def get_payment_sheets():
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, title, sheet_date, status, total_pesewas, created_at, updated_at, posted_at
+            FROM payment_sheets
+            ORDER BY sheet_date DESC, id DESC
+            """
+        ).fetchall()
+
+    return [serialize_payment_sheet(row) for row in rows]
+
+
+@app.get("/api/payment-sheets/draft")
+def get_latest_payment_draft():
+    with get_connection() as conn:
+        draft = conn.execute(
+            """
+            SELECT id
+            FROM payment_sheets
+            WHERE status = 'draft'
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+        if not draft:
+            return None
+
+        return get_payment_sheet_detail(conn, draft["id"])
+
+
+@app.post("/api/payment-sheets/draft")
+def save_payment_draft(payload: PaymentDraftPayload):
+    title = payload.title.strip()
+
+    if not title:
+        raise HTTPException(status_code=400, detail="Payment sheet title is required.")
+
+    with get_connection() as conn:
+        if payload.sheet_id:
+            sheet = conn.execute(
+                """
+                SELECT id, status
+                FROM payment_sheets
+                WHERE id = ?
+                """,
+                (payload.sheet_id,),
+            ).fetchone()
+
+            if not sheet:
+                raise HTTPException(status_code=404, detail="Payment sheet not found.")
+
+            if sheet["status"] != "draft":
+                raise HTTPException(
+                    status_code=400,
+                    detail="Only draft payment sheets can be auto-saved.",
+                )
+
+            sheet_id = payload.sheet_id
+
+            conn.execute(
+                """
+                UPDATE payment_sheets
+                SET title = ?,
+                    sheet_date = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (title, date.today().isoformat(), sheet_id),
+            )
+        else:
+            cursor = conn.execute(
+                """
+                INSERT INTO payment_sheets (title, sheet_date, status, total_pesewas)
+                VALUES (?, ?, 'draft', 0)
+                """,
+                (title, date.today().isoformat()),
+            )
+            sheet_id = cursor.lastrowid
+
+        replace_payment_entries(conn, sheet_id, payload.entries)
+
+        conn.commit()
+
+        return get_payment_sheet_detail(conn, sheet_id)
+
+
+@app.get("/api/payment-sheets/{sheet_id}")
+def get_payment_sheet(sheet_id: int):
+    with get_connection() as conn:
+        return get_payment_sheet_detail(conn, sheet_id)
+
+
+@app.post("/api/payment-sheets/{sheet_id}/post")
+def post_payment_sheet(sheet_id: int):
+    with get_connection() as conn:
+        sheet = conn.execute(
+            """
+            SELECT id, status
+            FROM payment_sheets
+            WHERE id = ?
+            """,
+            (sheet_id,),
+        ).fetchone()
+
+        if not sheet:
+            raise HTTPException(status_code=404, detail="Payment sheet not found.")
+
+        if sheet["status"] == "posted":
+            raise HTTPException(
+                status_code=400,
+                detail="This payment sheet has already been posted.",
+            )
+
+        entries = conn.execute(
+            """
+            SELECT id, bank_id, amount_pesewas
+            FROM payment_entries
+            WHERE sheet_id = ?
+            """,
+            (sheet_id,),
+        ).fetchall()
+
+        if len(entries) == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot post an empty payment sheet.",
+            )
+
+        bank_groups = group_amounts_by_bank(entries)
+
+        for bank_id, amount_pesewas in bank_groups.items():
+            bank = validate_bank_exists(conn, bank_id)
+
+            if bank["balance_pesewas"] - amount_pesewas < 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Cannot post payment sheet. {bank['name']} does not have enough balance.",
+                )
+
+        for bank_id, amount_pesewas in bank_groups.items():
+            conn.execute(
+                """
+                UPDATE banks
+                SET balance_pesewas = balance_pesewas - ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (amount_pesewas, bank_id),
+            )
+
+        conn.execute(
+            """
+            UPDATE payment_sheets
+            SET status = 'posted',
+                posted_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (sheet_id,),
+        )
+
+        conn.commit()
+
+        return get_payment_sheet_detail(conn, sheet_id)
+
+
+@app.patch("/api/payment-sheets/{sheet_id}")
+def update_posted_payment_sheet(sheet_id: int, payload: PaymentPostedUpdatePayload):
+    title = payload.title.strip()
+
+    if not title:
+        raise HTTPException(status_code=400, detail="Payment sheet title is required.")
+
+    with get_connection() as conn:
+        sheet = conn.execute(
+            """
+            SELECT id, status
+            FROM payment_sheets
+            WHERE id = ?
+            """,
+            (sheet_id,),
+        ).fetchone()
+
+        if not sheet:
+            raise HTTPException(status_code=404, detail="Payment sheet not found.")
+
+        if sheet["status"] != "posted":
+            raise HTTPException(
+                status_code=400,
+                detail="Only posted sheets should be updated here. Drafts auto-save separately.",
+            )
+
+        old_entries = conn.execute(
+            """
+            SELECT id, bank_id, amount_pesewas
+            FROM payment_entries
+            WHERE sheet_id = ?
+            """,
+            (sheet_id,),
+        ).fetchall()
+
+        old_bank_groups = group_amounts_by_bank(old_entries)
+
+        # Reverse old payment deductions by adding money back to banks.
+        for bank_id, amount_pesewas in old_bank_groups.items():
+            validate_bank_exists(conn, bank_id)
+
+            conn.execute(
+                """
+                UPDATE banks
+                SET balance_pesewas = balance_pesewas + ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (amount_pesewas, bank_id),
+            )
+
+        conn.execute(
+            """
+            UPDATE payment_sheets
+            SET title = ?,
+                sheet_date = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (title, date.today().isoformat(), sheet_id),
+        )
+
+        replace_payment_entries(conn, sheet_id, payload.entries)
+
+        new_entries = conn.execute(
+            """
+            SELECT id, bank_id, amount_pesewas
+            FROM payment_entries
+            WHERE sheet_id = ?
+            """,
+            (sheet_id,),
+        ).fetchall()
+
+        new_bank_groups = group_amounts_by_bank(new_entries)
+
+        # Check balances before applying new deductions.
+        for bank_id, amount_pesewas in new_bank_groups.items():
+            bank = validate_bank_exists(conn, bank_id)
+
+            if bank["balance_pesewas"] - amount_pesewas < 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"This edit cannot be saved. {bank['name']} does not have enough balance.",
+                )
+
+        for bank_id, amount_pesewas in new_bank_groups.items():
+            conn.execute(
+                """
+                UPDATE banks
+                SET balance_pesewas = balance_pesewas - ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (amount_pesewas, bank_id),
+            )
+
+        conn.commit()
+
+        return get_payment_sheet_detail(conn, sheet_id)
+
+
+@app.delete("/api/payment-sheets/{sheet_id}")
+def delete_payment_sheet(sheet_id: int):
+    with get_connection() as conn:
+        sheet = conn.execute(
+            """
+            SELECT id, status
+            FROM payment_sheets
+            WHERE id = ?
+            """,
+            (sheet_id,),
+        ).fetchone()
+
+        if not sheet:
+            raise HTTPException(status_code=404, detail="Payment sheet not found.")
+
+        entries = conn.execute(
+            """
+            SELECT id, bank_id, amount_pesewas
+            FROM payment_entries
+            WHERE sheet_id = ?
+            """,
+            (sheet_id,),
+        ).fetchall()
+
+        if sheet["status"] == "posted":
+            bank_groups = group_amounts_by_bank(entries)
+
+            # Deleting a posted payment reverses the deduction by adding money back.
+            for bank_id, amount_pesewas in bank_groups.items():
+                validate_bank_exists(conn, bank_id)
+
+                conn.execute(
+                    """
+                    UPDATE banks
+                    SET balance_pesewas = balance_pesewas + ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (amount_pesewas, bank_id),
+                )
+
+        conn.execute(
+            """
+            DELETE FROM payment_entries
+            WHERE sheet_id = ?
+            """,
+            (sheet_id,),
+        )
+
+        conn.execute(
+            """
+            DELETE FROM payment_sheets
+            WHERE id = ?
+            """,
+            (sheet_id,),
+        )
+
+        conn.commit()
+
+    return {"ok": True, "message": "Payment sheet deleted successfully."}
+
 
 @app.get("/api/dashboard/summary")
 def dashboard_summary():
@@ -836,9 +1355,9 @@ def dashboard_summary():
 
         payments_total = conn.execute(
             """
-            SELECT COALESCE(SUM(amount_pesewas), 0) AS total
-            FROM transactions
-            WHERE transaction_type = 'payment'
+            SELECT COALESCE(SUM(total_pesewas), 0) AS total
+            FROM payment_sheets
+            WHERE status = 'posted'
             """
         ).fetchone()["total"]
 
