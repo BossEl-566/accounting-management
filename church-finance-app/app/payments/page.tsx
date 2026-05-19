@@ -19,6 +19,7 @@ import {
   PaymentSource,
   PettyCashSummary,
   PettyCashWithdrawal,
+  SavingsAccount,
   createPettyCashWithdrawal,
   deletePaymentSheet,
   deletePettyCashWithdrawal,
@@ -28,6 +29,7 @@ import {
   getPaymentSheets,
   getPettyCashSummary,
   getPettyCashWithdrawals,
+  getSavingsAccounts,
   postPaymentSheet,
   savePaymentDraft,
   updatePostedPaymentSheet,
@@ -40,6 +42,7 @@ type PaymentFormRow = {
   subcategory: string;
   amount: string;
   bank_id: string;
+  savings_account_id: string;
   source: PaymentSource;
   note: string;
   isCustom?: boolean;
@@ -124,13 +127,17 @@ function getTodayLabel() {
   });
 }
 
-function buildBlankRows(defaultBankId: string): PaymentFormRow[] {
+function buildBlankRows(
+  defaultBankId: string,
+  defaultSavingsAccountId: string
+): PaymentFormRow[] {
   return basePaymentRows.map(([category, subcategory]) => ({
     rowId: makeRowId(),
     category,
     subcategory,
     amount: "",
     bank_id: defaultBankId,
+    savings_account_id: defaultSavingsAccountId,
     source: "bank",
     note: "",
   }));
@@ -138,22 +145,28 @@ function buildBlankRows(defaultBankId: string): PaymentFormRow[] {
 
 function mergeSavedEntriesIntoRows(
   savedEntries: PaymentEntry[],
-  defaultBankId: string
+  defaultBankId: string,
+  defaultSavingsAccountId: string
 ): PaymentFormRow[] {
-  const rows = buildBlankRows(defaultBankId);
+  const rows = buildBlankRows(defaultBankId, defaultSavingsAccountId);
 
   for (const entry of savedEntries) {
-    if (entry.source === "bank") {
+    if (entry.source === "bank" || entry.source === "savings") {
       const existingRow = rows.find(
         (row) =>
           row.category === entry.category &&
-          row.subcategory === entry.subcategory &&
-          row.source === "bank"
+          row.subcategory === entry.subcategory
       );
 
       if (existingRow) {
         existingRow.amount = String(entry.amount);
-        existingRow.bank_id = String(entry.bank_id ?? "");
+        existingRow.source = entry.source;
+        existingRow.bank_id = entry.bank_id
+          ? String(entry.bank_id)
+          : defaultBankId;
+        existingRow.savings_account_id = entry.savings_account_id
+          ? String(entry.savings_account_id)
+          : defaultSavingsAccountId;
         existingRow.note = entry.note ?? "";
         continue;
       }
@@ -164,7 +177,10 @@ function mergeSavedEntriesIntoRows(
       category: entry.category,
       subcategory: entry.subcategory,
       amount: String(entry.amount),
-      bank_id: entry.bank_id ? String(entry.bank_id) : "",
+      bank_id: entry.bank_id ? String(entry.bank_id) : defaultBankId,
+      savings_account_id: entry.savings_account_id
+        ? String(entry.savings_account_id)
+        : defaultSavingsAccountId,
       source: entry.source,
       note: entry.note ?? "",
       isCustom: true,
@@ -176,6 +192,7 @@ function mergeSavedEntriesIntoRows(
 
 export default function PaymentsPage() {
   const [banks, setBanks] = useState<Bank[]>([]);
+  const [savingsAccounts, setSavingsAccounts] = useState<SavingsAccount[]>([]);
   const [sheets, setSheets] = useState<PaymentSheet[]>([]);
   const [pettyCashSummary, setPettyCashSummary] =
     useState<PettyCashSummary | null>(null);
@@ -203,6 +220,8 @@ export default function PaymentsPage() {
   const [hasLoadedInitialData, setHasLoadedInitialData] = useState(false);
 
   const defaultBankId = banks.length > 0 ? String(banks[0].id) : "";
+  const defaultSavingsAccountId =
+    savingsAccounts.length > 0 ? String(savingsAccounts[0].id) : "";
 
   const formTotal = useMemo(() => {
     return rows.reduce((sum, row) => {
@@ -222,12 +241,14 @@ export default function PaymentsPage() {
 
       const [
         bankData,
+        savingsData,
         draftData,
         sheetData,
         pettySummaryData,
         withdrawalData,
       ] = await Promise.all([
         getBanks(),
+        getSavingsAccounts(),
         getLatestPaymentDraft(),
         getPaymentSheets(),
         getPettyCashSummary(),
@@ -235,11 +256,14 @@ export default function PaymentsPage() {
       ]);
 
       setBanks(bankData);
+      setSavingsAccounts(savingsData);
       setSheets(sheetData);
       setPettyCashSummary(pettySummaryData);
       setWithdrawals(withdrawalData);
 
       const firstBankId = bankData.length > 0 ? String(bankData[0].id) : "";
+      const firstSavingsId =
+        savingsData.length > 0 ? String(savingsData[0].id) : "";
 
       if (!withdrawBankId && firstBankId) {
         setWithdrawBankId(firstBankId);
@@ -249,11 +273,17 @@ export default function PaymentsPage() {
         setSheetId(draftData.id);
         setSheetStatus(draftData.status);
         setSheetTitle(draftData.title);
-        setRows(mergeSavedEntriesIntoRows(draftData.entries, firstBankId));
+        setRows(
+          mergeSavedEntriesIntoRows(
+            draftData.entries,
+            firstBankId,
+            firstSavingsId
+          )
+        );
       } else {
         setSheetId(null);
         setSheetStatus("new");
-        setRows(buildBlankRows(firstBankId));
+        setRows(buildBlankRows(firstBankId, firstSavingsId));
       }
 
       setHasLoadedInitialData(true);
@@ -268,14 +298,28 @@ export default function PaymentsPage() {
 
   function updateRow(rowId: string, field: keyof PaymentFormRow, value: string) {
     setRows((currentRows) =>
-      currentRows.map((row) =>
-        row.rowId === rowId
-          ? {
-              ...row,
-              [field]: value,
-            }
-          : row
-      )
+      currentRows.map((row) => {
+        if (row.rowId !== rowId) return row;
+
+        if (field === "source") {
+          const nextSource = value as PaymentSource;
+
+          return {
+            ...row,
+            source: nextSource,
+            bank_id: nextSource === "bank" ? row.bank_id || defaultBankId : "",
+            savings_account_id:
+              nextSource === "savings"
+                ? row.savings_account_id || defaultSavingsAccountId
+                : "",
+          };
+        }
+
+        return {
+          ...row,
+          [field]: value,
+        };
+      })
     );
   }
 
@@ -305,11 +349,23 @@ export default function PaymentsPage() {
         continue;
       }
 
+      if (row.source === "savings" && !row.savings_account_id) {
+        if (strict) {
+          throw new Error(
+            "Every savings payment must have a selected savings account."
+          );
+        }
+
+        continue;
+      }
+
       entries.push({
         category: row.category.trim(),
         subcategory: row.subcategory.trim(),
         amount,
         bank_id: row.source === "bank" ? Number(row.bank_id) : null,
+        savings_account_id:
+          row.source === "savings" ? Number(row.savings_account_id) : null,
         source: row.source,
         note: row.note.trim() || null,
       });
@@ -348,7 +404,15 @@ export default function PaymentsPage() {
     }, 1000);
 
     return () => window.clearTimeout(timer);
-  }, [rows, sheetTitle, sheetId, sheetStatus, hasLoadedInitialData, banks.length]);
+  }, [
+    rows,
+    sheetTitle,
+    sheetId,
+    sheetStatus,
+    hasLoadedInitialData,
+    banks.length,
+    savingsAccounts.length,
+  ]);
 
   async function handleWithdrawPettyCash(event: React.FormEvent) {
     event.preventDefault();
@@ -378,7 +442,9 @@ export default function PaymentsPage() {
 
       setWithdrawAmount("");
       setWithdrawNote("");
-      setSuccess("Petty cash withdrawn successfully. Bank balance has been deducted.");
+      setSuccess(
+        "Petty cash withdrawn successfully. Bank balance has been deducted."
+      );
       await loadInitialData();
     } catch (err) {
       setError(
@@ -432,6 +498,7 @@ export default function PaymentsPage() {
         subcategory: pettyName.trim(),
         amount: pettyAmount,
         bank_id: "",
+        savings_account_id: "",
         source: "petty_cash",
         note: pettyNote.trim(),
         isCustom: true,
@@ -466,7 +533,7 @@ export default function PaymentsPage() {
         });
 
         setSuccess(
-          "Posted payment sheet updated successfully. Bank and petty cash balances have been corrected."
+          "Posted payment sheet updated successfully. Bank, savings, and petty cash balances have been corrected."
         );
         await loadInitialData();
         return;
@@ -492,7 +559,7 @@ export default function PaymentsPage() {
     setSheetId(null);
     setSheetStatus("new");
     setSheetTitle("Sunday Payment Sheet");
-    setRows(buildBlankRows(defaultBankId));
+    setRows(buildBlankRows(defaultBankId, defaultSavingsAccountId));
     setDraftMessage("");
     setError("");
   }
@@ -507,10 +574,16 @@ export default function PaymentsPage() {
       setSheetId(sheet.id);
       setSheetStatus(sheet.status);
       setSheetTitle(sheet.title);
-      setRows(mergeSavedEntriesIntoRows(sheet.entries, defaultBankId));
+      setRows(
+        mergeSavedEntriesIntoRows(
+          sheet.entries,
+          defaultBankId,
+          defaultSavingsAccountId
+        )
+      );
       setDraftMessage(
         sheet.status === "posted"
-          ? "Viewing posted sheet. Changes affect banks and petty cash only when you save."
+          ? "Viewing posted sheet. Changes affect banks, savings, and petty cash only when you save."
           : "Draft loaded."
       );
     } catch (err) {
@@ -520,7 +593,7 @@ export default function PaymentsPage() {
 
   async function handleDeleteSheet(id: number) {
     const confirmed = window.confirm(
-      "Delete this payment sheet? Posted bank deductions will be reversed and petty cash expenses will be removed."
+      "Delete this payment sheet? Posted bank and savings deductions will be reversed, and petty cash expenses will be removed."
     );
 
     if (!confirmed) return;
@@ -547,6 +620,7 @@ export default function PaymentsPage() {
         subcategory: "",
         amount: "",
         bank_id: defaultBankId,
+        savings_account_id: defaultSavingsAccountId,
         source: "bank",
         note: "",
         isCustom: true,
@@ -583,7 +657,7 @@ export default function PaymentsPage() {
             Payments
           </h1>
           <p className="mt-2 text-sm font-medium text-slate-500">
-            Record bank payments and petty cash expenses without double deduction.
+            Record payments from bank accounts, savings accounts, and petty cash.
           </p>
         </div>
 
@@ -612,7 +686,9 @@ export default function PaymentsPage() {
               <Wallet size={20} />
             </div>
             <div>
-              <p className="text-sm font-bold text-slate-500">Petty Cash Balance</p>
+              <p className="text-sm font-bold text-slate-500">
+                Petty Cash Balance
+              </p>
               <p className="mt-1 text-2xl font-black text-slate-950">
                 {formatGHS(pettyCashSummary?.balance ?? 0)}
               </p>
@@ -644,7 +720,7 @@ export default function PaymentsPage() {
             Withdraw Petty Cash
           </h2>
           <p className="mt-1 text-sm text-slate-500">
-            This deducts from the selected bank once and increases petty cash.
+            This deducts from a selected bank once and increases petty cash.
           </p>
 
           <div className="mt-5 grid grid-cols-4 gap-4">
@@ -689,10 +765,13 @@ export default function PaymentsPage() {
           Add Petty Cash Expense to Payment Sheet
         </h2>
         <p className="mt-1 text-sm text-slate-500">
-          These expenses will reduce petty cash, not the bank.
+          These expenses reduce petty cash, not bank or savings accounts.
         </p>
 
-        <form onSubmit={addPettyCashExpenseToSheet} className="mt-5 grid grid-cols-5 gap-4">
+        <form
+          onSubmit={addPettyCashExpenseToSheet}
+          className="mt-5 grid grid-cols-5 gap-4"
+        >
           <select
             value={pettyCategory}
             onChange={(event) => setPettyCategory(event.target.value)}
@@ -749,7 +828,7 @@ export default function PaymentsPage() {
                   : "Create Payment Sheet"}
               </h2>
               <p className="text-sm text-slate-500">
-                Bank payments deduct banks. Petty cash expenses deduct petty cash.
+                Select whether each payment is from a bank or a savings account.
               </p>
             </div>
           </div>
@@ -836,7 +915,7 @@ export default function PaymentsPage() {
               <table className="w-full border-collapse bg-white text-left">
                 <thead>
                   <tr className="border-t border-slate-100">
-                    <th className="w-[23%] px-5 py-3 text-xs font-black uppercase tracking-wide text-slate-500">
+                    <th className="w-[21%] px-5 py-3 text-xs font-black uppercase tracking-wide text-slate-500">
                       Payment Name
                     </th>
                     <th className="w-[15%] px-5 py-3 text-xs font-black uppercase tracking-wide text-slate-500">
@@ -845,8 +924,8 @@ export default function PaymentsPage() {
                     <th className="w-[15%] px-5 py-3 text-xs font-black uppercase tracking-wide text-slate-500">
                       Amount
                     </th>
-                    <th className="w-[22%] px-5 py-3 text-xs font-black uppercase tracking-wide text-slate-500">
-                      Bank / Cash
+                    <th className="w-[24%] px-5 py-3 text-xs font-black uppercase tracking-wide text-slate-500">
+                      Account
                     </th>
                     <th className="px-5 py-3 text-xs font-black uppercase tracking-wide text-slate-500">
                       Note
@@ -865,7 +944,11 @@ export default function PaymentsPage() {
                           <input
                             value={row.subcategory}
                             onChange={(event) =>
-                              updateRow(row.rowId, "subcategory", event.target.value)
+                              updateRow(
+                                row.rowId,
+                                "subcategory",
+                                event.target.value
+                              )
                             }
                             placeholder="Enter payment name"
                             className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-semibold outline-none focus:border-blue-500"
@@ -878,16 +961,22 @@ export default function PaymentsPage() {
                       </td>
 
                       <td className="px-5 py-3">
-                        <span
-                          className={[
-                            "rounded-full px-3 py-1 text-xs font-black",
-                            row.source === "petty_cash"
-                              ? "bg-amber-50 text-amber-700"
-                              : "bg-blue-50 text-blue-700",
-                          ].join(" ")}
-                        >
-                          {row.source === "petty_cash" ? "Petty Cash" : "Bank"}
-                        </span>
+                        {row.source === "petty_cash" ? (
+                          <span className="rounded-full bg-amber-50 px-3 py-1 text-xs font-black text-amber-700">
+                            Petty Cash
+                          </span>
+                        ) : (
+                          <select
+                            value={row.source}
+                            onChange={(event) =>
+                              updateRow(row.rowId, "source", event.target.value)
+                            }
+                            className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-semibold outline-none focus:border-blue-500"
+                          >
+                            <option value="bank">Bank</option>
+                            <option value="savings">Savings</option>
+                          </select>
+                        )}
                       </td>
 
                       <td className="px-5 py-3">
@@ -909,6 +998,24 @@ export default function PaymentsPage() {
                           <div className="rounded-xl border border-amber-100 bg-amber-50 px-3 py-2 text-sm font-black text-amber-700">
                             From Petty Cash
                           </div>
+                        ) : row.source === "savings" ? (
+                          <select
+                            value={row.savings_account_id}
+                            onChange={(event) =>
+                              updateRow(
+                                row.rowId,
+                                "savings_account_id",
+                                event.target.value
+                              )
+                            }
+                            className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-semibold outline-none focus:border-blue-500"
+                          >
+                            {savingsAccounts.map((account) => (
+                              <option key={account.id} value={account.id}>
+                                {account.name} - {formatGHS(account.balance)}
+                              </option>
+                            ))}
+                          </select>
                         ) : (
                           <select
                             value={row.bank_id}
@@ -984,7 +1091,8 @@ export default function PaymentsPage() {
               Previous Payment Sheets
             </h2>
             <p className="text-sm text-slate-500">
-              Posted sheets have already affected bank or petty cash balances.
+              Posted sheets have already affected bank, savings, or petty cash
+              balances.
             </p>
           </div>
         </div>

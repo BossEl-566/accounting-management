@@ -13,6 +13,16 @@ from pydantic import BaseModel, Field
 BASE_DIR = Path(__file__).resolve().parents[1]
 DB_PATH = BASE_DIR / "database" / "church_finance.db"
 
+PETTY_CASH_ALLOWED_CATEGORIES = {
+    "Utilities",
+    "Donation & Support",
+    "Decor",
+    "Telephone & Communication",
+    "Repairs & Maintenance",
+    "Publicity",
+    "Decoration",
+}
+
 
 def get_connection():
     connection = sqlite3.connect(DB_PATH)
@@ -41,6 +51,15 @@ def clean_optional_text(value: Optional[str]) -> Optional[str]:
     return cleaned if cleaned else None
 
 
+def normalize_payment_source(source: Optional[str]) -> str:
+    cleaned = (source or "bank").strip()
+
+    if cleaned not in ["bank", "savings", "petty_cash"]:
+        raise HTTPException(status_code=400, detail="Invalid payment source.")
+
+    return cleaned
+
+
 def serialize_bank(row: sqlite3.Row):
     return {
         "id": row["id"],
@@ -48,6 +67,29 @@ def serialize_bank(row: sqlite3.Row):
         "balance": pesewas_to_money(row["balance_pesewas"]),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+    }
+
+
+def serialize_savings_account(row: sqlite3.Row):
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "balance": pesewas_to_money(row["balance_pesewas"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def serialize_savings_transfer(row: sqlite3.Row):
+    return {
+        "id": row["id"],
+        "bank_id": row["bank_id"],
+        "bank_name": row["bank_name"],
+        "savings_account_id": row["savings_account_id"],
+        "savings_account_name": row["savings_account_name"],
+        "amount": pesewas_to_money(row["amount_pesewas"]),
+        "note": row["note"],
+        "created_at": row["created_at"],
     }
 
 
@@ -79,44 +121,6 @@ def serialize_receipt_sheet(row: sqlite3.Row):
     }
 
 
-def get_receipt_sheet_detail(conn: sqlite3.Connection, sheet_id: int):
-    sheet = conn.execute(
-        """
-        SELECT id, title, sheet_date, status, total_pesewas, created_at, updated_at, posted_at
-        FROM receipt_sheets
-        WHERE id = ?
-        """,
-        (sheet_id,),
-    ).fetchone()
-
-    if not sheet:
-        raise HTTPException(status_code=404, detail="Receipt sheet not found.")
-
-    entries = conn.execute(
-        """
-        SELECT
-            receipt_entries.id,
-            receipt_entries.sheet_id,
-            receipt_entries.category,
-            receipt_entries.subcategory,
-            receipt_entries.amount_pesewas,
-            receipt_entries.bank_id,
-            banks.name AS bank_name,
-            receipt_entries.note,
-            receipt_entries.created_at,
-            receipt_entries.updated_at
-        FROM receipt_entries
-        LEFT JOIN banks ON banks.id = receipt_entries.bank_id
-        WHERE receipt_entries.sheet_id = ?
-        ORDER BY receipt_entries.id ASC
-        """,
-        (sheet_id,),
-    ).fetchall()
-
-    data = serialize_receipt_sheet(sheet)
-    data["entries"] = [serialize_receipt_entry(entry) for entry in entries]
-    return data
-
 def serialize_payment_entry(row: sqlite3.Row):
     return {
         "id": row["id"],
@@ -126,6 +130,8 @@ def serialize_payment_entry(row: sqlite3.Row):
         "amount": pesewas_to_money(row["amount_pesewas"]),
         "bank_id": row["bank_id"],
         "bank_name": row["bank_name"],
+        "savings_account_id": row["savings_account_id"],
+        "savings_account_name": row["savings_account_name"],
         "source": row["source"],
         "note": row["note"],
         "created_at": row["created_at"],
@@ -146,139 +152,15 @@ def serialize_payment_sheet(row: sqlite3.Row):
     }
 
 
-def get_payment_sheet_detail(conn: sqlite3.Connection, sheet_id: int):
-    sheet = conn.execute(
-        """
-        SELECT id, title, sheet_date, status, total_pesewas, created_at, updated_at, posted_at
-        FROM payment_sheets
-        WHERE id = ?
-        """,
-        (sheet_id,),
-    ).fetchone()
-
-    if not sheet:
-        raise HTTPException(status_code=404, detail="Payment sheet not found.")
-
-    entries = conn.execute(
-        """
-        SELECT
-            payment_entries.id,
-            payment_entries.sheet_id,
-            payment_entries.category,
-            payment_entries.subcategory,
-            payment_entries.amount_pesewas,
-            payment_entries.bank_id,
-            banks.name AS bank_name,
-            payment_entries.source,
-            payment_entries.note,
-            payment_entries.created_at,
-            payment_entries.updated_at
-        FROM payment_entries
-        LEFT JOIN banks ON banks.id = payment_entries.bank_id
-        WHERE payment_entries.sheet_id = ?
-        ORDER BY payment_entries.id ASC
-        """,
-        (sheet_id,),
-    ).fetchall()
-
-    data = serialize_payment_sheet(sheet)
-    data["entries"] = [serialize_payment_entry(entry) for entry in entries]
-    return data
-
-
-def replace_payment_entries(
-    conn: sqlite3.Connection,
-    sheet_id: int,
-    entries: list,
-) -> int:
-    total_pesewas = 0
-
-    conn.execute(
-        """
-        DELETE FROM payment_entries
-        WHERE sheet_id = ?
-        """,
-        (sheet_id,),
-    )
-
-    for entry in entries:
-        category = entry.category.strip()
-        subcategory = entry.subcategory.strip()
-        note = clean_optional_text(entry.note)
-        source = normalize_payment_source(entry.source)
-        amount_pesewas = money_to_pesewas(entry.amount)
-
-        if not category:
-            raise HTTPException(status_code=400, detail="Payment category is required.")
-
-        if not subcategory:
-            raise HTTPException(status_code=400, detail="Payment name is required.")
-
-        bank_id = entry.bank_id
-
-        if source == "bank":
-            if bank_id is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Bank payment entry must have a selected bank.",
-                )
-
-            validate_bank_exists(conn, bank_id)
-
-        if source == "petty_cash":
-            bank_id = None
-
-            if category not in PETTY_CASH_ALLOWED_CATEGORIES:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Petty cash cannot be used for {category}.",
-                )
-
-        conn.execute(
-            """
-            INSERT INTO payment_entries (
-                sheet_id,
-                category,
-                subcategory,
-                amount_pesewas,
-                bank_id,
-                source,
-                note
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                sheet_id,
-                category,
-                subcategory,
-                amount_pesewas,
-                bank_id,
-                source,
-                note,
-            ),
-        )
-
-        total_pesewas += amount_pesewas
-
-    conn.execute(
-        """
-        UPDATE payment_sheets
-        SET total_pesewas = ?,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-        """,
-        (total_pesewas, sheet_id),
-    )
-
-    return total_pesewas
-def group_amounts_by_bank(entries: List[sqlite3.Row]):
-    grouped = {}
-
-    for entry in entries:
-        bank_id = entry["bank_id"]
-        grouped[bank_id] = grouped.get(bank_id, 0) + entry["amount_pesewas"]
-
-    return grouped
+def serialize_petty_cash_withdrawal(row: sqlite3.Row):
+    return {
+        "id": row["id"],
+        "bank_id": row["bank_id"],
+        "bank_name": row["bank_name"],
+        "amount": pesewas_to_money(row["amount_pesewas"]),
+        "note": row["note"],
+        "created_at": row["created_at"],
+    }
 
 
 def validate_bank_exists(conn: sqlite3.Connection, bank_id: int):
@@ -296,24 +178,31 @@ def validate_bank_exists(conn: sqlite3.Connection, bank_id: int):
 
     return bank
 
-PETTY_CASH_ALLOWED_CATEGORIES = {
-    "Utilities",
-    "Donation & Support",
-    "Decor",
-    "Telephone & Communication",
-    "Repairs & Maintenance",
-    "Publicity",
-    "Decoration",
-}
+
+def validate_savings_account_exists(conn: sqlite3.Connection, savings_account_id: int):
+    savings_account = conn.execute(
+        """
+        SELECT id, name, balance_pesewas
+        FROM savings_accounts
+        WHERE id = ?
+        """,
+        (savings_account_id,),
+    ).fetchone()
+
+    if not savings_account:
+        raise HTTPException(status_code=404, detail="Selected savings account was not found.")
+
+    return savings_account
 
 
-def normalize_payment_source(source: Optional[str]) -> str:
-    cleaned = (source or "bank").strip()
+def group_amounts_by_bank(entries: List[sqlite3.Row]):
+    grouped = {}
 
-    if cleaned not in ["bank", "petty_cash"]:
-        raise HTTPException(status_code=400, detail="Invalid payment source.")
+    for entry in entries:
+        bank_id = entry["bank_id"]
+        grouped[bank_id] = grouped.get(bank_id, 0) + entry["amount_pesewas"]
 
-    return cleaned
+    return grouped
 
 
 def group_bank_payment_amounts(entries: List[sqlite3.Row]):
@@ -332,6 +221,28 @@ def group_bank_payment_amounts(entries: List[sqlite3.Row]):
             )
 
         grouped[bank_id] = grouped.get(bank_id, 0) + entry["amount_pesewas"]
+
+    return grouped
+
+
+def group_savings_payment_amounts(entries: List[sqlite3.Row]):
+    grouped = {}
+
+    for entry in entries:
+        if entry["source"] != "savings":
+            continue
+
+        savings_account_id = entry["savings_account_id"]
+
+        if savings_account_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Savings payment entry is missing a savings account.",
+            )
+
+        grouped[savings_account_id] = (
+            grouped.get(savings_account_id, 0) + entry["amount_pesewas"]
+        )
 
     return grouped
 
@@ -389,17 +300,6 @@ def get_petty_cash_balance_pesewas(
     return get_petty_cash_totals(conn, exclude_payment_sheet_id)["balance"]
 
 
-def serialize_petty_cash_withdrawal(row: sqlite3.Row):
-    return {
-        "id": row["id"],
-        "bank_id": row["bank_id"],
-        "bank_name": row["bank_name"],
-        "amount": pesewas_to_money(row["amount_pesewas"]),
-        "note": row["note"],
-        "created_at": row["created_at"],
-    }
-
-
 def ensure_payment_entries_schema(conn: sqlite3.Connection):
     existing_table = conn.execute(
         """
@@ -416,13 +316,23 @@ def ensure_payment_entries_schema(conn: sqlite3.Connection):
     column_map = {column["name"]: column for column in columns}
     column_names = set(column_map.keys())
 
-    bank_id_is_not_null = bool(column_map.get("bank_id") and column_map["bank_id"]["notnull"] == 1)
-    source_missing = "source" not in column_names
+    bank_id_is_not_null = bool(
+        column_map.get("bank_id") and column_map["bank_id"]["notnull"] == 1
+    )
 
-    if not bank_id_is_not_null and not source_missing:
+    needs_rebuild = (
+        bank_id_is_not_null
+        or "source" not in column_names
+        or "savings_account_id" not in column_names
+    )
+
+    if not needs_rebuild:
         return
 
     source_expression = "source" if "source" in column_names else "'bank'"
+    savings_expression = (
+        "savings_account_id" if "savings_account_id" in column_names else "NULL"
+    )
 
     conn.execute("ALTER TABLE payment_entries RENAME TO payment_entries_old")
 
@@ -435,12 +345,14 @@ def ensure_payment_entries_schema(conn: sqlite3.Connection):
             subcategory TEXT NOT NULL,
             amount_pesewas INTEGER NOT NULL CHECK(amount_pesewas > 0),
             bank_id INTEGER,
+            savings_account_id INTEGER,
             source TEXT NOT NULL DEFAULT 'bank',
             note TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(sheet_id) REFERENCES payment_sheets(id) ON DELETE CASCADE,
-            FOREIGN KEY(bank_id) REFERENCES banks(id)
+            FOREIGN KEY(bank_id) REFERENCES banks(id),
+            FOREIGN KEY(savings_account_id) REFERENCES savings_accounts(id)
         )
         """
     )
@@ -454,6 +366,7 @@ def ensure_payment_entries_schema(conn: sqlite3.Connection):
             subcategory,
             amount_pesewas,
             bank_id,
+            savings_account_id,
             source,
             note,
             created_at,
@@ -466,6 +379,7 @@ def ensure_payment_entries_schema(conn: sqlite3.Connection):
             subcategory,
             amount_pesewas,
             bank_id,
+            {savings_expression},
             {source_expression},
             note,
             created_at,
@@ -477,6 +391,88 @@ def ensure_payment_entries_schema(conn: sqlite3.Connection):
     conn.execute("DROP TABLE payment_entries_old")
 
 
+def get_receipt_sheet_detail(conn: sqlite3.Connection, sheet_id: int):
+    sheet = conn.execute(
+        """
+        SELECT id, title, sheet_date, status, total_pesewas, created_at, updated_at, posted_at
+        FROM receipt_sheets
+        WHERE id = ?
+        """,
+        (sheet_id,),
+    ).fetchone()
+
+    if not sheet:
+        raise HTTPException(status_code=404, detail="Receipt sheet not found.")
+
+    entries = conn.execute(
+        """
+        SELECT
+            receipt_entries.id,
+            receipt_entries.sheet_id,
+            receipt_entries.category,
+            receipt_entries.subcategory,
+            receipt_entries.amount_pesewas,
+            receipt_entries.bank_id,
+            banks.name AS bank_name,
+            receipt_entries.note,
+            receipt_entries.created_at,
+            receipt_entries.updated_at
+        FROM receipt_entries
+        LEFT JOIN banks ON banks.id = receipt_entries.bank_id
+        WHERE receipt_entries.sheet_id = ?
+        ORDER BY receipt_entries.id ASC
+        """,
+        (sheet_id,),
+    ).fetchall()
+
+    data = serialize_receipt_sheet(sheet)
+    data["entries"] = [serialize_receipt_entry(entry) for entry in entries]
+    return data
+
+
+def get_payment_sheet_detail(conn: sqlite3.Connection, sheet_id: int):
+    sheet = conn.execute(
+        """
+        SELECT id, title, sheet_date, status, total_pesewas, created_at, updated_at, posted_at
+        FROM payment_sheets
+        WHERE id = ?
+        """,
+        (sheet_id,),
+    ).fetchone()
+
+    if not sheet:
+        raise HTTPException(status_code=404, detail="Payment sheet not found.")
+
+    entries = conn.execute(
+        """
+        SELECT
+            payment_entries.id,
+            payment_entries.sheet_id,
+            payment_entries.category,
+            payment_entries.subcategory,
+            payment_entries.amount_pesewas,
+            payment_entries.bank_id,
+            banks.name AS bank_name,
+            payment_entries.savings_account_id,
+            savings_accounts.name AS savings_account_name,
+            payment_entries.source,
+            payment_entries.note,
+            payment_entries.created_at,
+            payment_entries.updated_at
+        FROM payment_entries
+        LEFT JOIN banks ON banks.id = payment_entries.bank_id
+        LEFT JOIN savings_accounts ON savings_accounts.id = payment_entries.savings_account_id
+        WHERE payment_entries.sheet_id = ?
+        ORDER BY payment_entries.id ASC
+        """,
+        (sheet_id,),
+    ).fetchall()
+
+    data = serialize_payment_sheet(sheet)
+    data["entries"] = [serialize_payment_entry(entry) for entry in entries]
+    return data
+
+
 def replace_receipt_entries(
     conn: sqlite3.Connection,
     sheet_id: int,
@@ -484,13 +480,7 @@ def replace_receipt_entries(
 ) -> int:
     total_pesewas = 0
 
-    conn.execute(
-        """
-        DELETE FROM receipt_entries
-        WHERE sheet_id = ?
-        """,
-        (sheet_id,),
-    )
+    conn.execute("DELETE FROM receipt_entries WHERE sheet_id = ?", (sheet_id,))
 
     for entry in entries:
         category = entry.category.strip()
@@ -543,6 +533,102 @@ def replace_receipt_entries(
     return total_pesewas
 
 
+def replace_payment_entries(
+    conn: sqlite3.Connection,
+    sheet_id: int,
+    entries: list,
+) -> int:
+    total_pesewas = 0
+
+    conn.execute("DELETE FROM payment_entries WHERE sheet_id = ?", (sheet_id,))
+
+    for entry in entries:
+        category = entry.category.strip()
+        subcategory = entry.subcategory.strip()
+        note = clean_optional_text(entry.note)
+        source = normalize_payment_source(entry.source)
+        amount_pesewas = money_to_pesewas(entry.amount)
+
+        if not category:
+            raise HTTPException(status_code=400, detail="Payment category is required.")
+
+        if not subcategory:
+            raise HTTPException(status_code=400, detail="Payment name is required.")
+
+        bank_id = entry.bank_id
+        savings_account_id = entry.savings_account_id
+
+        if source == "bank":
+            if bank_id is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Bank payment entry must have a selected bank.",
+                )
+
+            validate_bank_exists(conn, bank_id)
+            savings_account_id = None
+
+        if source == "savings":
+            if savings_account_id is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Savings payment entry must have a selected savings account.",
+                )
+
+            validate_savings_account_exists(conn, savings_account_id)
+            bank_id = None
+
+        if source == "petty_cash":
+            bank_id = None
+            savings_account_id = None
+
+            if category not in PETTY_CASH_ALLOWED_CATEGORIES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Petty cash cannot be used for {category}.",
+                )
+
+        conn.execute(
+            """
+            INSERT INTO payment_entries (
+                sheet_id,
+                category,
+                subcategory,
+                amount_pesewas,
+                bank_id,
+                savings_account_id,
+                source,
+                note
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                sheet_id,
+                category,
+                subcategory,
+                amount_pesewas,
+                bank_id,
+                savings_account_id,
+                source,
+                note,
+            ),
+        )
+
+        total_pesewas += amount_pesewas
+
+    conn.execute(
+        """
+        UPDATE payment_sheets
+        SET total_pesewas = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (total_pesewas, sheet_id),
+    )
+
+    return total_pesewas
+
+
 def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -572,6 +658,33 @@ def init_db():
                 note TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(bank_id) REFERENCES banks(id)
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS savings_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                balance_pesewas INTEGER NOT NULL DEFAULT 0 CHECK(balance_pesewas >= 0),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS savings_transfers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bank_id INTEGER NOT NULL,
+                savings_account_id INTEGER NOT NULL,
+                amount_pesewas INTEGER NOT NULL CHECK(amount_pesewas > 0),
+                note TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(bank_id) REFERENCES banks(id),
+                FOREIGN KEY(savings_account_id) REFERENCES savings_accounts(id)
             )
             """
         )
@@ -608,6 +721,7 @@ def init_db():
             )
             """
         )
+
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS payment_sheets (
@@ -632,12 +746,14 @@ def init_db():
                 subcategory TEXT NOT NULL,
                 amount_pesewas INTEGER NOT NULL CHECK(amount_pesewas > 0),
                 bank_id INTEGER,
+                savings_account_id INTEGER,
                 source TEXT NOT NULL DEFAULT 'bank',
                 note TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(sheet_id) REFERENCES payment_sheets(id) ON DELETE CASCADE,
-                FOREIGN KEY(bank_id) REFERENCES banks(id)
+                FOREIGN KEY(bank_id) REFERENCES banks(id),
+                FOREIGN KEY(savings_account_id) REFERENCES savings_accounts(id)
             )
             """
         )
@@ -655,9 +771,6 @@ def init_db():
             """
         )
 
-        ensure_payment_entries_schema(conn)
-        
-
         for bank_name in ["NIB", "CBG", "Zenith"]:
             conn.execute(
                 """
@@ -666,6 +779,17 @@ def init_db():
                 """,
                 (bank_name, 0),
             )
+
+        for savings_name in ["Naatoa", "Credit Union"]:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO savings_accounts (name, balance_pesewas)
+                VALUES (?, ?)
+                """,
+                (savings_name, 0),
+            )
+
+        ensure_payment_entries_schema(conn)
 
         conn.commit()
 
@@ -702,6 +826,23 @@ class BankUpdate(BaseModel):
     balance: Optional[Decimal] = Field(default=None, ge=0)
 
 
+class SavingsAccountCreate(BaseModel):
+    name: str = Field(min_length=2)
+    balance: Decimal = Field(default=Decimal("0.00"), ge=0)
+
+
+class SavingsAccountUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=2)
+    balance: Optional[Decimal] = Field(default=None, ge=0)
+
+
+class SavingsTransferCreate(BaseModel):
+    bank_id: int
+    savings_account_id: int
+    amount: Decimal = Field(gt=0)
+    note: Optional[str] = None
+
+
 class ReceiptEntryPayload(BaseModel):
     category: str = Field(min_length=2)
     subcategory: str = Field(min_length=1)
@@ -720,11 +861,13 @@ class ReceiptPostedUpdatePayload(BaseModel):
     title: str = Field(min_length=2)
     entries: List[ReceiptEntryPayload] = Field(default_factory=list)
 
+
 class PaymentEntryPayload(BaseModel):
     category: str = Field(min_length=2)
     subcategory: str = Field(min_length=1)
     amount: Decimal = Field(gt=0)
     bank_id: Optional[int] = None
+    savings_account_id: Optional[int] = None
     source: str = Field(default="bank")
     note: Optional[str] = None
 
@@ -739,10 +882,13 @@ class PaymentPostedUpdatePayload(BaseModel):
     title: str = Field(min_length=2)
     entries: List[PaymentEntryPayload] = Field(default_factory=list)
 
+
 class PettyCashWithdrawalCreate(BaseModel):
     bank_id: int
     amount: Decimal = Field(gt=0)
     note: Optional[str] = None
+
+
 @app.get("/api/health")
 def health_check():
     return {
@@ -855,44 +1001,43 @@ def update_bank(bank_id: int, payload: BankUpdate):
 @app.delete("/api/banks/{bank_id}")
 def delete_bank(bank_id: int):
     with get_connection() as conn:
-        existing = conn.execute(
-            """
-            SELECT id FROM banks WHERE id = ?
-            """,
-            (bank_id,),
-        ).fetchone()
+        existing = conn.execute("SELECT id FROM banks WHERE id = ?", (bank_id,)).fetchone()
 
         if not existing:
             raise HTTPException(status_code=404, detail="Bank not found.")
 
         transaction_count = conn.execute(
-            """
-            SELECT COUNT(*) AS total
-            FROM transactions
-            WHERE bank_id = ?
-            """,
+            "SELECT COUNT(*) AS total FROM transactions WHERE bank_id = ?",
             (bank_id,),
         ).fetchone()["total"]
 
         receipt_entry_count = conn.execute(
-            """
-            SELECT COUNT(*) AS total
-            FROM receipt_entries
-            WHERE bank_id = ?
-            """,
+            "SELECT COUNT(*) AS total FROM receipt_entries WHERE bank_id = ?",
             (bank_id,),
         ).fetchone()["total"]
 
         payment_entry_count = conn.execute(
-            """
-            SELECT COUNT(*) AS total
-            FROM payment_entries
-            WHERE bank_id = ?
-            """,
+            "SELECT COUNT(*) AS total FROM payment_entries WHERE bank_id = ?",
             (bank_id,),
         ).fetchone()["total"]
 
-        if transaction_count > 0 or receipt_entry_count > 0 or payment_entry_count > 0:
+        savings_transfer_count = conn.execute(
+            "SELECT COUNT(*) AS total FROM savings_transfers WHERE bank_id = ?",
+            (bank_id,),
+        ).fetchone()["total"]
+
+        petty_cash_count = conn.execute(
+            "SELECT COUNT(*) AS total FROM petty_cash_withdrawals WHERE bank_id = ?",
+            (bank_id,),
+        ).fetchone()["total"]
+
+        if (
+            transaction_count > 0
+            or receipt_entry_count > 0
+            or payment_entry_count > 0
+            or savings_transfer_count > 0
+            or petty_cash_count > 0
+        ):
             raise HTTPException(
                 status_code=400,
                 detail="This bank has records and cannot be deleted.",
@@ -904,6 +1049,316 @@ def delete_bank(bank_id: int):
     return {"ok": True, "message": "Bank deleted successfully."}
 
 
+@app.get("/api/savings/accounts")
+def get_savings_accounts():
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, name, balance_pesewas, created_at, updated_at
+            FROM savings_accounts
+            ORDER BY name ASC
+            """
+        ).fetchall()
+
+    return [serialize_savings_account(row) for row in rows]
+
+
+@app.post("/api/savings/accounts")
+def create_savings_account(payload: SavingsAccountCreate):
+    name = payload.name.strip()
+
+    if not name:
+        raise HTTPException(status_code=400, detail="Savings account name is required.")
+
+    balance_pesewas = money_to_pesewas(payload.balance)
+
+    try:
+        with get_connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO savings_accounts (name, balance_pesewas)
+                VALUES (?, ?)
+                """,
+                (name, balance_pesewas),
+            )
+            conn.commit()
+
+            row = conn.execute(
+                """
+                SELECT id, name, balance_pesewas, created_at, updated_at
+                FROM savings_accounts
+                WHERE id = ?
+                """,
+                (cursor.lastrowid,),
+            ).fetchone()
+
+            return serialize_savings_account(row)
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="This savings account already exists.")
+
+
+@app.patch("/api/savings/accounts/{savings_account_id}")
+def update_savings_account(savings_account_id: int, payload: SavingsAccountUpdate):
+    with get_connection() as conn:
+        existing = conn.execute(
+            """
+            SELECT id, name, balance_pesewas, created_at, updated_at
+            FROM savings_accounts
+            WHERE id = ?
+            """,
+            (savings_account_id,),
+        ).fetchone()
+
+        if not existing:
+            raise HTTPException(status_code=404, detail="Savings account not found.")
+
+        new_name = existing["name"]
+        new_balance = existing["balance_pesewas"]
+
+        if payload.name is not None:
+            new_name = payload.name.strip()
+            if not new_name:
+                raise HTTPException(status_code=400, detail="Savings account name is required.")
+
+        if payload.balance is not None:
+            new_balance = money_to_pesewas(payload.balance)
+
+        try:
+            conn.execute(
+                """
+                UPDATE savings_accounts
+                SET name = ?,
+                    balance_pesewas = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (new_name, new_balance, savings_account_id),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            raise HTTPException(status_code=409, detail="This savings account already exists.")
+
+        updated = conn.execute(
+            """
+            SELECT id, name, balance_pesewas, created_at, updated_at
+            FROM savings_accounts
+            WHERE id = ?
+            """,
+            (savings_account_id,),
+        ).fetchone()
+
+    return serialize_savings_account(updated)
+
+
+@app.delete("/api/savings/accounts/{savings_account_id}")
+def delete_savings_account(savings_account_id: int):
+    with get_connection() as conn:
+        existing = conn.execute(
+            """
+            SELECT id
+            FROM savings_accounts
+            WHERE id = ?
+            """,
+            (savings_account_id,),
+        ).fetchone()
+
+        if not existing:
+            raise HTTPException(status_code=404, detail="Savings account not found.")
+
+        transfer_count = conn.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM savings_transfers
+            WHERE savings_account_id = ?
+            """,
+            (savings_account_id,),
+        ).fetchone()["total"]
+
+        payment_count = conn.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM payment_entries
+            WHERE savings_account_id = ?
+            """,
+            (savings_account_id,),
+        ).fetchone()["total"]
+
+        if transfer_count > 0 or payment_count > 0:
+            raise HTTPException(
+                status_code=400,
+                detail="This savings account has records and cannot be deleted.",
+            )
+
+        conn.execute(
+            """
+            DELETE FROM savings_accounts
+            WHERE id = ?
+            """,
+            (savings_account_id,),
+        )
+        conn.commit()
+
+    return {"ok": True, "message": "Savings account deleted successfully."}
+
+
+@app.get("/api/savings/transfers")
+def get_savings_transfers():
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                savings_transfers.id,
+                savings_transfers.bank_id,
+                banks.name AS bank_name,
+                savings_transfers.savings_account_id,
+                savings_accounts.name AS savings_account_name,
+                savings_transfers.amount_pesewas,
+                savings_transfers.note,
+                savings_transfers.created_at
+            FROM savings_transfers
+            INNER JOIN banks ON banks.id = savings_transfers.bank_id
+            INNER JOIN savings_accounts ON savings_accounts.id = savings_transfers.savings_account_id
+            ORDER BY savings_transfers.created_at DESC, savings_transfers.id DESC
+            """
+        ).fetchall()
+
+    return [serialize_savings_transfer(row) for row in rows]
+
+
+@app.post("/api/savings/transfers")
+def create_savings_transfer(payload: SavingsTransferCreate):
+    amount_pesewas = money_to_pesewas(payload.amount)
+    note = clean_optional_text(payload.note)
+
+    with get_connection() as conn:
+        bank = validate_bank_exists(conn, payload.bank_id)
+        savings_account = validate_savings_account_exists(conn, payload.savings_account_id)
+
+        if bank["balance_pesewas"] - amount_pesewas < 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{bank['name']} does not have enough balance for this savings transfer.",
+            )
+
+        conn.execute(
+            """
+            UPDATE banks
+            SET balance_pesewas = balance_pesewas - ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (amount_pesewas, payload.bank_id),
+        )
+
+        conn.execute(
+            """
+            UPDATE savings_accounts
+            SET balance_pesewas = balance_pesewas + ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (amount_pesewas, payload.savings_account_id),
+        )
+
+        cursor = conn.execute(
+            """
+            INSERT INTO savings_transfers (
+                bank_id,
+                savings_account_id,
+                amount_pesewas,
+                note
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                payload.bank_id,
+                payload.savings_account_id,
+                amount_pesewas,
+                note,
+            ),
+        )
+
+        conn.commit()
+
+        row = conn.execute(
+            """
+            SELECT
+                savings_transfers.id,
+                savings_transfers.bank_id,
+                banks.name AS bank_name,
+                savings_transfers.savings_account_id,
+                savings_accounts.name AS savings_account_name,
+                savings_transfers.amount_pesewas,
+                savings_transfers.note,
+                savings_transfers.created_at
+            FROM savings_transfers
+            INNER JOIN banks ON banks.id = savings_transfers.bank_id
+            INNER JOIN savings_accounts ON savings_accounts.id = savings_transfers.savings_account_id
+            WHERE savings_transfers.id = ?
+            """,
+            (cursor.lastrowid,),
+        ).fetchone()
+
+    return serialize_savings_transfer(row)
+
+
+@app.delete("/api/savings/transfers/{transfer_id}")
+def delete_savings_transfer(transfer_id: int):
+    with get_connection() as conn:
+        transfer = conn.execute(
+            """
+            SELECT id, bank_id, savings_account_id, amount_pesewas
+            FROM savings_transfers
+            WHERE id = ?
+            """,
+            (transfer_id,),
+        ).fetchone()
+
+        if not transfer:
+            raise HTTPException(status_code=404, detail="Savings transfer not found.")
+
+        savings_account = validate_savings_account_exists(
+            conn,
+            transfer["savings_account_id"],
+        )
+
+        if savings_account["balance_pesewas"] - transfer["amount_pesewas"] < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot delete this transfer because part of the savings has already been used.",
+            )
+
+        conn.execute(
+            """
+            UPDATE banks
+            SET balance_pesewas = balance_pesewas + ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (transfer["amount_pesewas"], transfer["bank_id"]),
+        )
+
+        conn.execute(
+            """
+            UPDATE savings_accounts
+            SET balance_pesewas = balance_pesewas - ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (transfer["amount_pesewas"], transfer["savings_account_id"]),
+        )
+
+        conn.execute(
+            """
+            DELETE FROM savings_transfers
+            WHERE id = ?
+            """,
+            (transfer_id,),
+        )
+
+        conn.commit()
+
+    return {"ok": True, "message": "Savings transfer deleted successfully."}
 @app.get("/api/receipt-sheets")
 def get_receipt_sheets():
     with get_connection() as conn:
@@ -947,11 +1402,7 @@ def save_receipt_draft(payload: ReceiptDraftPayload):
     with get_connection() as conn:
         if payload.sheet_id:
             sheet = conn.execute(
-                """
-                SELECT id, status
-                FROM receipt_sheets
-                WHERE id = ?
-                """,
+                "SELECT id, status FROM receipt_sheets WHERE id = ?",
                 (payload.sheet_id,),
             ).fetchone()
 
@@ -1003,11 +1454,7 @@ def get_receipt_sheet(sheet_id: int):
 def post_receipt_sheet(sheet_id: int):
     with get_connection() as conn:
         sheet = conn.execute(
-            """
-            SELECT id, status
-            FROM receipt_sheets
-            WHERE id = ?
-            """,
+            "SELECT id, status FROM receipt_sheets WHERE id = ?",
             (sheet_id,),
         ).fetchone()
 
@@ -1037,7 +1484,6 @@ def post_receipt_sheet(sheet_id: int):
 
         for entry in entries:
             validate_bank_exists(conn, entry["bank_id"])
-
             conn.execute(
                 """
                 UPDATE banks
@@ -1073,11 +1519,7 @@ def update_posted_receipt_sheet(sheet_id: int, payload: ReceiptPostedUpdatePaylo
 
     with get_connection() as conn:
         sheet = conn.execute(
-            """
-            SELECT id, status
-            FROM receipt_sheets
-            WHERE id = ?
-            """,
+            "SELECT id, status FROM receipt_sheets WHERE id = ?",
             (sheet_id,),
         ).fetchone()
 
@@ -1087,7 +1529,7 @@ def update_posted_receipt_sheet(sheet_id: int, payload: ReceiptPostedUpdatePaylo
         if sheet["status"] != "posted":
             raise HTTPException(
                 status_code=400,
-                detail="Only posted sheets should be updated here. Drafts auto-save separately.",
+                detail="Only posted sheets should be updated here.",
             )
 
         old_entries = conn.execute(
@@ -1163,11 +1605,7 @@ def update_posted_receipt_sheet(sheet_id: int, payload: ReceiptPostedUpdatePaylo
 def delete_receipt_sheet(sheet_id: int):
     with get_connection() as conn:
         sheet = conn.execute(
-            """
-            SELECT id, status
-            FROM receipt_sheets
-            WHERE id = ?
-            """,
+            "SELECT id, status FROM receipt_sheets WHERE id = ?",
             (sheet_id,),
         ).fetchone()
 
@@ -1206,25 +1644,12 @@ def delete_receipt_sheet(sheet_id: int):
                     (amount_pesewas, bank_id),
                 )
 
-        conn.execute(
-            """
-            DELETE FROM receipt_entries
-            WHERE sheet_id = ?
-            """,
-            (sheet_id,),
-        )
-
-        conn.execute(
-            """
-            DELETE FROM receipt_sheets
-            WHERE id = ?
-            """,
-            (sheet_id,),
-        )
-
+        conn.execute("DELETE FROM receipt_entries WHERE sheet_id = ?", (sheet_id,))
+        conn.execute("DELETE FROM receipt_sheets WHERE id = ?", (sheet_id,))
         conn.commit()
 
     return {"ok": True, "message": "Receipt sheet deleted successfully."}
+
 
 @app.get("/api/petty-cash/summary")
 def get_petty_cash_summary():
@@ -1285,11 +1710,7 @@ def create_petty_cash_withdrawal(payload: PettyCashWithdrawalCreate):
 
         cursor = conn.execute(
             """
-            INSERT INTO petty_cash_withdrawals (
-                bank_id,
-                amount_pesewas,
-                note
-            )
+            INSERT INTO petty_cash_withdrawals (bank_id, amount_pesewas, note)
             VALUES (?, ?, ?)
             """,
             (payload.bank_id, amount_pesewas, note),
@@ -1350,17 +1771,13 @@ def delete_petty_cash_withdrawal(withdrawal_id: int):
         )
 
         conn.execute(
-            """
-            DELETE FROM petty_cash_withdrawals
-            WHERE id = ?
-            """,
+            "DELETE FROM petty_cash_withdrawals WHERE id = ?",
             (withdrawal_id,),
         )
 
         conn.commit()
 
     return {"ok": True, "message": "Petty cash withdrawal deleted successfully."}
-
 @app.get("/api/payment-sheets")
 def get_payment_sheets():
     with get_connection() as conn:
@@ -1404,11 +1821,7 @@ def save_payment_draft(payload: PaymentDraftPayload):
     with get_connection() as conn:
         if payload.sheet_id:
             sheet = conn.execute(
-                """
-                SELECT id, status
-                FROM payment_sheets
-                WHERE id = ?
-                """,
+                "SELECT id, status FROM payment_sheets WHERE id = ?",
                 (payload.sheet_id,),
             ).fetchone()
 
@@ -1460,11 +1873,7 @@ def get_payment_sheet(sheet_id: int):
 def post_payment_sheet(sheet_id: int):
     with get_connection() as conn:
         sheet = conn.execute(
-            """
-            SELECT id, status
-            FROM payment_sheets
-            WHERE id = ?
-            """,
+            "SELECT id, status FROM payment_sheets WHERE id = ?",
             (sheet_id,),
         ).fetchone()
 
@@ -1479,7 +1888,7 @@ def post_payment_sheet(sheet_id: int):
 
         entries = conn.execute(
             """
-            SELECT id, bank_id, amount_pesewas, source
+            SELECT id, bank_id, savings_account_id, amount_pesewas, source
             FROM payment_entries
             WHERE sheet_id = ?
             """,
@@ -1493,6 +1902,7 @@ def post_payment_sheet(sheet_id: int):
             )
 
         bank_groups = group_bank_payment_amounts(entries)
+        savings_groups = group_savings_payment_amounts(entries)
         petty_cash_total = sum_petty_cash_entries(entries)
 
         for bank_id, amount_pesewas in bank_groups.items():
@@ -1502,6 +1912,15 @@ def post_payment_sheet(sheet_id: int):
                 raise HTTPException(
                     status_code=400,
                     detail=f"Cannot post payment sheet. {bank['name']} does not have enough balance.",
+                )
+
+        for savings_account_id, amount_pesewas in savings_groups.items():
+            savings_account = validate_savings_account_exists(conn, savings_account_id)
+
+            if savings_account["balance_pesewas"] - amount_pesewas < 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Cannot post payment sheet. {savings_account['name']} does not have enough balance.",
                 )
 
         petty_cash_balance = get_petty_cash_balance_pesewas(conn)
@@ -1521,6 +1940,17 @@ def post_payment_sheet(sheet_id: int):
                 WHERE id = ?
                 """,
                 (amount_pesewas, bank_id),
+            )
+
+        for savings_account_id, amount_pesewas in savings_groups.items():
+            conn.execute(
+                """
+                UPDATE savings_accounts
+                SET balance_pesewas = balance_pesewas - ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (amount_pesewas, savings_account_id),
             )
 
         conn.execute(
@@ -1548,11 +1978,7 @@ def update_posted_payment_sheet(sheet_id: int, payload: PaymentPostedUpdatePaylo
 
     with get_connection() as conn:
         sheet = conn.execute(
-            """
-            SELECT id, status
-            FROM payment_sheets
-            WHERE id = ?
-            """,
+            "SELECT id, status FROM payment_sheets WHERE id = ?",
             (sheet_id,),
         ).fetchone()
 
@@ -1562,12 +1988,12 @@ def update_posted_payment_sheet(sheet_id: int, payload: PaymentPostedUpdatePaylo
         if sheet["status"] != "posted":
             raise HTTPException(
                 status_code=400,
-                detail="Only posted sheets should be updated here. Drafts auto-save separately.",
+                detail="Only posted sheets should be updated here.",
             )
 
         old_entries = conn.execute(
             """
-            SELECT id, bank_id, amount_pesewas, source
+            SELECT id, bank_id, savings_account_id, amount_pesewas, source
             FROM payment_entries
             WHERE sheet_id = ?
             """,
@@ -1575,11 +2001,10 @@ def update_posted_payment_sheet(sheet_id: int, payload: PaymentPostedUpdatePaylo
         ).fetchall()
 
         old_bank_groups = group_bank_payment_amounts(old_entries)
+        old_savings_groups = group_savings_payment_amounts(old_entries)
 
-        # Reverse old payment deductions by adding money back to banks.
         for bank_id, amount_pesewas in old_bank_groups.items():
             validate_bank_exists(conn, bank_id)
-
             conn.execute(
                 """
                 UPDATE banks
@@ -1588,6 +2013,18 @@ def update_posted_payment_sheet(sheet_id: int, payload: PaymentPostedUpdatePaylo
                 WHERE id = ?
                 """,
                 (amount_pesewas, bank_id),
+            )
+
+        for savings_account_id, amount_pesewas in old_savings_groups.items():
+            validate_savings_account_exists(conn, savings_account_id)
+            conn.execute(
+                """
+                UPDATE savings_accounts
+                SET balance_pesewas = balance_pesewas + ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (amount_pesewas, savings_account_id),
             )
 
         conn.execute(
@@ -1605,7 +2042,7 @@ def update_posted_payment_sheet(sheet_id: int, payload: PaymentPostedUpdatePaylo
 
         new_entries = conn.execute(
             """
-            SELECT id, bank_id, amount_pesewas
+            SELECT id, bank_id, savings_account_id, amount_pesewas, source
             FROM payment_entries
             WHERE sheet_id = ?
             """,
@@ -1613,7 +2050,27 @@ def update_posted_payment_sheet(sheet_id: int, payload: PaymentPostedUpdatePaylo
         ).fetchall()
 
         new_bank_groups = group_bank_payment_amounts(new_entries)
+        new_savings_groups = group_savings_payment_amounts(new_entries)
         new_petty_cash_total = sum_petty_cash_entries(new_entries)
+
+        for bank_id, amount_pesewas in new_bank_groups.items():
+            bank = validate_bank_exists(conn, bank_id)
+
+            if bank["balance_pesewas"] - amount_pesewas < 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"This edit cannot be saved. {bank['name']} does not have enough balance.",
+                )
+
+        for savings_account_id, amount_pesewas in new_savings_groups.items():
+            savings_account = validate_savings_account_exists(conn, savings_account_id)
+
+            if savings_account["balance_pesewas"] - amount_pesewas < 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"This edit cannot be saved. {savings_account['name']} does not have enough balance.",
+                )
+
         available_petty_cash = get_petty_cash_balance_pesewas(
             conn,
             exclude_payment_sheet_id=sheet_id,
@@ -1624,16 +2081,6 @@ def update_posted_payment_sheet(sheet_id: int, payload: PaymentPostedUpdatePaylo
                 status_code=400,
                 detail="This edit cannot be saved. Petty cash balance is not enough.",
             )
-
-        # Check balances before applying new deductions.
-        for bank_id, amount_pesewas in new_bank_groups.items():
-            bank = validate_bank_exists(conn, bank_id)
-
-            if bank["balance_pesewas"] - amount_pesewas < 0:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"This edit cannot be saved. {bank['name']} does not have enough balance.",
-                )
 
         for bank_id, amount_pesewas in new_bank_groups.items():
             conn.execute(
@@ -1646,6 +2093,17 @@ def update_posted_payment_sheet(sheet_id: int, payload: PaymentPostedUpdatePaylo
                 (amount_pesewas, bank_id),
             )
 
+        for savings_account_id, amount_pesewas in new_savings_groups.items():
+            conn.execute(
+                """
+                UPDATE savings_accounts
+                SET balance_pesewas = balance_pesewas - ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (amount_pesewas, savings_account_id),
+            )
+
         conn.commit()
 
         return get_payment_sheet_detail(conn, sheet_id)
@@ -1655,11 +2113,7 @@ def update_posted_payment_sheet(sheet_id: int, payload: PaymentPostedUpdatePaylo
 def delete_payment_sheet(sheet_id: int):
     with get_connection() as conn:
         sheet = conn.execute(
-            """
-            SELECT id, status
-            FROM payment_sheets
-            WHERE id = ?
-            """,
+            "SELECT id, status FROM payment_sheets WHERE id = ?",
             (sheet_id,),
         ).fetchone()
 
@@ -1668,7 +2122,7 @@ def delete_payment_sheet(sheet_id: int):
 
         entries = conn.execute(
             """
-            SELECT id, bank_id, amount_pesewas, source
+            SELECT id, bank_id, savings_account_id, amount_pesewas, source
             FROM payment_entries
             WHERE sheet_id = ?
             """,
@@ -1677,11 +2131,10 @@ def delete_payment_sheet(sheet_id: int):
 
         if sheet["status"] == "posted":
             bank_groups = group_bank_payment_amounts(entries)
+            savings_groups = group_savings_payment_amounts(entries)
 
-            # Deleting a posted payment reverses the deduction by adding money back.
             for bank_id, amount_pesewas in bank_groups.items():
                 validate_bank_exists(conn, bank_id)
-
                 conn.execute(
                     """
                     UPDATE banks
@@ -1692,22 +2145,20 @@ def delete_payment_sheet(sheet_id: int):
                     (amount_pesewas, bank_id),
                 )
 
-        conn.execute(
-            """
-            DELETE FROM payment_entries
-            WHERE sheet_id = ?
-            """,
-            (sheet_id,),
-        )
+            for savings_account_id, amount_pesewas in savings_groups.items():
+                validate_savings_account_exists(conn, savings_account_id)
+                conn.execute(
+                    """
+                    UPDATE savings_accounts
+                    SET balance_pesewas = balance_pesewas + ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (amount_pesewas, savings_account_id),
+                )
 
-        conn.execute(
-            """
-            DELETE FROM payment_sheets
-            WHERE id = ?
-            """,
-            (sheet_id,),
-        )
-
+        conn.execute("DELETE FROM payment_entries WHERE sheet_id = ?", (sheet_id,))
+        conn.execute("DELETE FROM payment_sheets WHERE id = ?", (sheet_id,))
         conn.commit()
 
     return {"ok": True, "message": "Payment sheet deleted successfully."}
@@ -1725,6 +2176,13 @@ def dashboard_summary():
             """
         ).fetchone()
 
+        savings_total = conn.execute(
+            """
+            SELECT COALESCE(SUM(balance_pesewas), 0) AS total
+            FROM savings_accounts
+            """
+        ).fetchone()["total"]
+
         receipts_total = conn.execute(
             """
             SELECT COALESCE(SUM(total_pesewas), 0) AS total
@@ -1741,11 +2199,13 @@ def dashboard_summary():
             """
         ).fetchone()["total"]
 
+        petty_cash_balance = get_petty_cash_balance_pesewas(conn)
+
     return {
         "bank_count": bank_summary["bank_count"],
         "total_balance": pesewas_to_money(bank_summary["total_balance"]),
         "receipts_total": pesewas_to_money(receipts_total),
         "payments_total": pesewas_to_money(payments_total),
-        "petty_cash_balance": pesewas_to_money(get_petty_cash_balance_pesewas(conn)),
-        "savings_total": 0,
+        "petty_cash_balance": pesewas_to_money(petty_cash_balance),
+        "savings_total": pesewas_to_money(savings_total),
     }

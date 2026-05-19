@@ -8,6 +8,25 @@ export type Bank = {
   updated_at: string;
 };
 
+export type SavingsAccount = {
+  id: number;
+  name: string;
+  balance: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type SavingsTransfer = {
+  id: number;
+  bank_id: number;
+  bank_name: string;
+  savings_account_id: number;
+  savings_account_name: string;
+  amount: number;
+  note: string | null;
+  created_at: string;
+};
+
 export type ReceiptEntryInput = {
   category: string;
   subcategory: string;
@@ -44,13 +63,14 @@ export type ReceiptSheetDetail = ReceiptSheet & {
   entries: ReceiptEntry[];
 };
 
-export type PaymentSource = "bank" | "petty_cash";
+export type PaymentSource = "bank" | "savings" | "petty_cash";
 
 export type PaymentEntryInput = {
   category: string;
   subcategory: string;
   amount: number;
   bank_id?: number | null;
+  savings_account_id?: number | null;
   source: PaymentSource;
   note?: string | null;
 };
@@ -63,25 +83,12 @@ export type PaymentEntry = {
   amount: number;
   bank_id: number | null;
   bank_name: string | null;
+  savings_account_id: number | null;
+  savings_account_name: string | null;
   source: PaymentSource;
   note: string | null;
   created_at: string;
   updated_at: string;
-};
-
-export type PettyCashSummary = {
-  balance: number;
-  total_withdrawn: number;
-  total_spent: number;
-};
-
-export type PettyCashWithdrawal = {
-  id: number;
-  bank_id: number;
-  bank_name: string;
-  amount: number;
-  note: string | null;
-  created_at: string;
 };
 
 export type PaymentSheet = {
@@ -97,6 +104,21 @@ export type PaymentSheet = {
 
 export type PaymentSheetDetail = PaymentSheet & {
   entries: PaymentEntry[];
+};
+
+export type PettyCashSummary = {
+  balance: number;
+  total_withdrawn: number;
+  total_spent: number;
+};
+
+export type PettyCashWithdrawal = {
+  id: number;
+  bank_id: number;
+  bank_name: string;
+  amount: number;
+  note: string | null;
+  created_at: string;
 };
 
 export type DashboardSummary = {
@@ -118,10 +140,7 @@ async function handleResponse<T>(response: Response): Promise<T> {
 }
 
 export async function getBanks(): Promise<Bank[]> {
-  const response = await fetch(`${API_BASE_URL}/banks`, {
-    cache: "no-store",
-  });
-
+  const response = await fetch(`${API_BASE_URL}/banks`, { cache: "no-store" });
   return handleResponse<Bank[]>(response);
 }
 
@@ -131,9 +150,7 @@ export async function createBank(payload: {
 }): Promise<Bank> {
   const response = await fetch(`${API_BASE_URL}/banks`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
 
@@ -142,16 +159,11 @@ export async function createBank(payload: {
 
 export async function updateBank(
   id: number,
-  payload: {
-    name?: string;
-    balance?: number;
-  }
+  payload: { name?: string; balance?: number }
 ): Promise<Bank> {
   const response = await fetch(`${API_BASE_URL}/banks/${id}`, {
     method: "PATCH",
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
 
@@ -166,6 +178,78 @@ export async function deleteBank(id: number): Promise<{ ok: boolean }> {
   return handleResponse<{ ok: boolean }>(response);
 }
 
+export async function getSavingsAccounts(): Promise<SavingsAccount[]> {
+  const response = await fetch(`${API_BASE_URL}/savings/accounts`, {
+    cache: "no-store",
+  });
+
+  return handleResponse<SavingsAccount[]>(response);
+}
+
+export async function createSavingsAccount(payload: {
+  name: string;
+  balance: number;
+}): Promise<SavingsAccount> {
+  const response = await fetch(`${API_BASE_URL}/savings/accounts`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  return handleResponse<SavingsAccount>(response);
+}
+
+export async function updateSavingsAccount(
+  id: number,
+  payload: { name?: string; balance?: number }
+): Promise<SavingsAccount> {
+  const response = await fetch(`${API_BASE_URL}/savings/accounts/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  return handleResponse<SavingsAccount>(response);
+}
+
+export async function deleteSavingsAccount(id: number): Promise<{ ok: boolean }> {
+  const response = await fetch(`${API_BASE_URL}/savings/accounts/${id}`, {
+    method: "DELETE",
+  });
+
+  return handleResponse<{ ok: boolean }>(response);
+}
+
+export async function getSavingsTransfers(): Promise<SavingsTransfer[]> {
+  const response = await fetch(`${API_BASE_URL}/savings/transfers`, {
+    cache: "no-store",
+  });
+
+  return handleResponse<SavingsTransfer[]>(response);
+}
+
+export async function createSavingsTransfer(payload: {
+  bank_id: number;
+  savings_account_id: number;
+  amount: number;
+  note?: string | null;
+}): Promise<SavingsTransfer> {
+  const response = await fetch(`${API_BASE_URL}/savings/transfers`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  return handleResponse<SavingsTransfer>(response);
+}
+
+export async function deleteSavingsTransfer(id: number): Promise<{ ok: boolean }> {
+  const response = await fetch(`${API_BASE_URL}/savings/transfers/${id}`, {
+    method: "DELETE",
+  });
+
+  return handleResponse<{ ok: boolean }>(response);
+}
 export async function getReceiptSheets(): Promise<ReceiptSheet[]> {
   const response = await fetch(`${API_BASE_URL}/receipt-sheets`, {
     cache: "no-store",
@@ -174,9 +258,7 @@ export async function getReceiptSheets(): Promise<ReceiptSheet[]> {
   return handleResponse<ReceiptSheet[]>(response);
 }
 
-export async function getReceiptSheet(
-  id: number
-): Promise<ReceiptSheetDetail> {
+export async function getReceiptSheet(id: number): Promise<ReceiptSheetDetail> {
   const response = await fetch(`${API_BASE_URL}/receipt-sheets/${id}`, {
     cache: "no-store",
   });
@@ -199,18 +281,14 @@ export async function saveReceiptDraft(payload: {
 }): Promise<ReceiptSheetDetail> {
   const response = await fetch(`${API_BASE_URL}/receipt-sheets/draft`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
 
   return handleResponse<ReceiptSheetDetail>(response);
 }
 
-export async function postReceiptSheet(
-  id: number
-): Promise<ReceiptSheetDetail> {
+export async function postReceiptSheet(id: number): Promise<ReceiptSheetDetail> {
   const response = await fetch(`${API_BASE_URL}/receipt-sheets/${id}/post`, {
     method: "POST",
   });
@@ -220,25 +298,18 @@ export async function postReceiptSheet(
 
 export async function updatePostedReceiptSheet(
   id: number,
-  payload: {
-    title: string;
-    entries: ReceiptEntryInput[];
-  }
+  payload: { title: string; entries: ReceiptEntryInput[] }
 ): Promise<ReceiptSheetDetail> {
   const response = await fetch(`${API_BASE_URL}/receipt-sheets/${id}`, {
     method: "PATCH",
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
 
   return handleResponse<ReceiptSheetDetail>(response);
 }
 
-export async function deleteReceiptSheet(
-  id: number
-): Promise<{ ok: boolean }> {
+export async function deleteReceiptSheet(id: number): Promise<{ ok: boolean }> {
   const response = await fetch(`${API_BASE_URL}/receipt-sheets/${id}`, {
     method: "DELETE",
   });
@@ -254,9 +325,7 @@ export async function getPaymentSheets(): Promise<PaymentSheet[]> {
   return handleResponse<PaymentSheet[]>(response);
 }
 
-export async function getPaymentSheet(
-  id: number
-): Promise<PaymentSheetDetail> {
+export async function getPaymentSheet(id: number): Promise<PaymentSheetDetail> {
   const response = await fetch(`${API_BASE_URL}/payment-sheets/${id}`, {
     cache: "no-store",
   });
@@ -279,18 +348,14 @@ export async function savePaymentDraft(payload: {
 }): Promise<PaymentSheetDetail> {
   const response = await fetch(`${API_BASE_URL}/payment-sheets/draft`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
 
   return handleResponse<PaymentSheetDetail>(response);
 }
 
-export async function postPaymentSheet(
-  id: number
-): Promise<PaymentSheetDetail> {
+export async function postPaymentSheet(id: number): Promise<PaymentSheetDetail> {
   const response = await fetch(`${API_BASE_URL}/payment-sheets/${id}/post`, {
     method: "POST",
   });
@@ -300,25 +365,18 @@ export async function postPaymentSheet(
 
 export async function updatePostedPaymentSheet(
   id: number,
-  payload: {
-    title: string;
-    entries: PaymentEntryInput[];
-  }
+  payload: { title: string; entries: PaymentEntryInput[] }
 ): Promise<PaymentSheetDetail> {
   const response = await fetch(`${API_BASE_URL}/payment-sheets/${id}`, {
     method: "PATCH",
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
 
   return handleResponse<PaymentSheetDetail>(response);
 }
 
-export async function deletePaymentSheet(
-  id: number
-): Promise<{ ok: boolean }> {
+export async function deletePaymentSheet(id: number): Promise<{ ok: boolean }> {
   const response = await fetch(`${API_BASE_URL}/payment-sheets/${id}`, {
     method: "DELETE",
   });
@@ -334,9 +392,7 @@ export async function getPettyCashSummary(): Promise<PettyCashSummary> {
   return handleResponse<PettyCashSummary>(response);
 }
 
-export async function getPettyCashWithdrawals(): Promise<
-  PettyCashWithdrawal[]
-> {
+export async function getPettyCashWithdrawals(): Promise<PettyCashWithdrawal[]> {
   const response = await fetch(`${API_BASE_URL}/petty-cash/withdrawals`, {
     cache: "no-store",
   });
@@ -351,9 +407,7 @@ export async function createPettyCashWithdrawal(payload: {
 }): Promise<PettyCashWithdrawal> {
   const response = await fetch(`${API_BASE_URL}/petty-cash/withdrawals`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
 
