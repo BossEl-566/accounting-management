@@ -42,6 +42,21 @@ def serialize_bank(row: sqlite3.Row):
     }
 
 
+def serialize_transaction(row: sqlite3.Row):
+    return {
+        "id": row["id"],
+        "transaction_type": row["transaction_type"],
+        "category": row["category"],
+        "subcategory": row["subcategory"],
+        "amount": pesewas_to_money(row["amount_pesewas"]),
+        "bank_id": row["bank_id"],
+        "bank_name": row["bank_name"],
+        "source": row["source"],
+        "note": row["note"],
+        "created_at": row["created_at"],
+    }
+
+
 def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -117,6 +132,22 @@ class BankCreate(BaseModel):
 class BankUpdate(BaseModel):
     name: Optional[str] = Field(default=None, min_length=2)
     balance: Optional[Decimal] = Field(default=None, ge=0)
+
+
+class ReceiptCreate(BaseModel):
+    category: str = Field(min_length=2)
+    subcategory: Optional[str] = None
+    amount: Decimal = Field(gt=0)
+    bank_id: int
+    note: Optional[str] = None
+
+
+class ReceiptUpdate(BaseModel):
+    category: str = Field(min_length=2)
+    subcategory: Optional[str] = None
+    amount: Decimal = Field(gt=0)
+    bank_id: int
+    note: Optional[str] = None
 
 
 @app.get("/api/health")
@@ -260,6 +291,314 @@ def delete_bank(bank_id: int):
         conn.commit()
 
     return {"ok": True, "message": "Bank deleted successfully."}
+
+
+@app.get("/api/receipts")
+def get_receipts():
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                transactions.id,
+                transactions.transaction_type,
+                transactions.category,
+                transactions.subcategory,
+                transactions.amount_pesewas,
+                transactions.bank_id,
+                banks.name AS bank_name,
+                transactions.source,
+                transactions.note,
+                transactions.created_at
+            FROM transactions
+            LEFT JOIN banks ON banks.id = transactions.bank_id
+            WHERE transactions.transaction_type = 'receipt'
+            ORDER BY transactions.created_at DESC, transactions.id DESC
+            """
+        ).fetchall()
+
+    return [serialize_transaction(row) for row in rows]
+
+
+@app.post("/api/receipts")
+def create_receipt(payload: ReceiptCreate):
+    category = payload.category.strip()
+    subcategory = payload.subcategory.strip() if payload.subcategory else None
+    note = payload.note.strip() if payload.note else None
+    amount_pesewas = money_to_pesewas(payload.amount)
+
+    if not category:
+        raise HTTPException(status_code=400, detail="Receipt category is required.")
+
+    with get_connection() as conn:
+        bank = conn.execute(
+            """
+            SELECT id, balance_pesewas
+            FROM banks
+            WHERE id = ?
+            """,
+            (payload.bank_id,),
+        ).fetchone()
+
+        if not bank:
+            raise HTTPException(status_code=404, detail="Selected bank was not found.")
+
+        cursor = conn.execute(
+            """
+            INSERT INTO transactions (
+                transaction_type,
+                category,
+                subcategory,
+                amount_pesewas,
+                bank_id,
+                source,
+                note
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "receipt",
+                category,
+                subcategory,
+                amount_pesewas,
+                payload.bank_id,
+                "bank",
+                note,
+            ),
+        )
+
+        conn.execute(
+            """
+            UPDATE banks
+            SET balance_pesewas = balance_pesewas + ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (amount_pesewas, payload.bank_id),
+        )
+
+        conn.commit()
+
+        row = conn.execute(
+            """
+            SELECT
+                transactions.id,
+                transactions.transaction_type,
+                transactions.category,
+                transactions.subcategory,
+                transactions.amount_pesewas,
+                transactions.bank_id,
+                banks.name AS bank_name,
+                transactions.source,
+                transactions.note,
+                transactions.created_at
+            FROM transactions
+            LEFT JOIN banks ON banks.id = transactions.bank_id
+            WHERE transactions.id = ?
+            """,
+            (cursor.lastrowid,),
+        ).fetchone()
+
+    return serialize_transaction(row)
+
+
+@app.patch("/api/receipts/{receipt_id}")
+def update_receipt(receipt_id: int, payload: ReceiptUpdate):
+    category = payload.category.strip()
+    subcategory = payload.subcategory.strip() if payload.subcategory else None
+    note = payload.note.strip() if payload.note else None
+    new_amount_pesewas = money_to_pesewas(payload.amount)
+
+    if not category:
+        raise HTTPException(status_code=400, detail="Receipt category is required.")
+
+    with get_connection() as conn:
+        existing = conn.execute(
+            """
+            SELECT id, amount_pesewas, bank_id
+            FROM transactions
+            WHERE id = ? AND transaction_type = 'receipt'
+            """,
+            (receipt_id,),
+        ).fetchone()
+
+        if not existing:
+            raise HTTPException(status_code=404, detail="Receipt not found.")
+
+        old_bank = conn.execute(
+            """
+            SELECT id, balance_pesewas
+            FROM banks
+            WHERE id = ?
+            """,
+            (existing["bank_id"],),
+        ).fetchone()
+
+        new_bank = conn.execute(
+            """
+            SELECT id, balance_pesewas
+            FROM banks
+            WHERE id = ?
+            """,
+            (payload.bank_id,),
+        ).fetchone()
+
+        if not new_bank:
+            raise HTTPException(status_code=404, detail="Selected bank was not found.")
+
+        old_amount_pesewas = existing["amount_pesewas"]
+        old_bank_id = existing["bank_id"]
+        new_bank_id = payload.bank_id
+
+        if old_bank_id == new_bank_id:
+            corrected_balance = (
+                old_bank["balance_pesewas"] - old_amount_pesewas + new_amount_pesewas
+            )
+
+            if corrected_balance < 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="This edit would make the selected bank balance negative.",
+                )
+
+            conn.execute(
+                """
+                UPDATE banks
+                SET balance_pesewas = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (corrected_balance, old_bank_id),
+            )
+        else:
+            old_bank_after_reversal = old_bank["balance_pesewas"] - old_amount_pesewas
+
+            if old_bank_after_reversal < 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Cannot move this receipt because reversing it would make the old bank negative.",
+                )
+
+            conn.execute(
+                """
+                UPDATE banks
+                SET balance_pesewas = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (old_bank_after_reversal, old_bank_id),
+            )
+
+            conn.execute(
+                """
+                UPDATE banks
+                SET balance_pesewas = balance_pesewas + ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (new_amount_pesewas, new_bank_id),
+            )
+
+        conn.execute(
+            """
+            UPDATE transactions
+            SET category = ?,
+                subcategory = ?,
+                amount_pesewas = ?,
+                bank_id = ?,
+                note = ?
+            WHERE id = ? AND transaction_type = 'receipt'
+            """,
+            (
+                category,
+                subcategory,
+                new_amount_pesewas,
+                new_bank_id,
+                note,
+                receipt_id,
+            ),
+        )
+
+        conn.commit()
+
+        row = conn.execute(
+            """
+            SELECT
+                transactions.id,
+                transactions.transaction_type,
+                transactions.category,
+                transactions.subcategory,
+                transactions.amount_pesewas,
+                transactions.bank_id,
+                banks.name AS bank_name,
+                transactions.source,
+                transactions.note,
+                transactions.created_at
+            FROM transactions
+            LEFT JOIN banks ON banks.id = transactions.bank_id
+            WHERE transactions.id = ?
+            """,
+            (receipt_id,),
+        ).fetchone()
+
+    return serialize_transaction(row)
+
+
+@app.delete("/api/receipts/{receipt_id}")
+def delete_receipt(receipt_id: int):
+    with get_connection() as conn:
+        existing = conn.execute(
+            """
+            SELECT id, amount_pesewas, bank_id
+            FROM transactions
+            WHERE id = ? AND transaction_type = 'receipt'
+            """,
+            (receipt_id,),
+        ).fetchone()
+
+        if not existing:
+            raise HTTPException(status_code=404, detail="Receipt not found.")
+
+        bank = conn.execute(
+            """
+            SELECT id, balance_pesewas
+            FROM banks
+            WHERE id = ?
+            """,
+            (existing["bank_id"],),
+        ).fetchone()
+
+        if not bank:
+            raise HTTPException(status_code=404, detail="Receipt bank was not found.")
+
+        new_balance = bank["balance_pesewas"] - existing["amount_pesewas"]
+
+        if new_balance < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot delete this receipt because it would make the bank balance negative.",
+            )
+
+        conn.execute(
+            """
+            UPDATE banks
+            SET balance_pesewas = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (new_balance, existing["bank_id"]),
+        )
+
+        conn.execute(
+            """
+            DELETE FROM transactions
+            WHERE id = ? AND transaction_type = 'receipt'
+            """,
+            (receipt_id,),
+        )
+
+        conn.commit()
+
+    return {"ok": True, "message": "Receipt deleted successfully."}
 
 
 @app.get("/api/dashboard/summary")

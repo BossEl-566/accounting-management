@@ -8,6 +8,19 @@ export type Bank = {
   updated_at: string;
 };
 
+export type Transaction = {
+  id: number;
+  transaction_type: "receipt" | "payment";
+  category: string;
+  subcategory: string | null;
+  amount: number;
+  bank_id: number | null;
+  bank_name: string | null;
+  source: string;
+  note: string | null;
+  created_at: string;
+};
+
 export type DashboardSummary = {
   bank_count: number;
   total_balance: number;
@@ -69,6 +82,61 @@ export async function updateBank(
 
 export async function deleteBank(id: number): Promise<{ ok: boolean }> {
   const response = await fetch(`${API_BASE_URL}/banks/${id}`, {
+    method: "DELETE",
+  });
+
+  return handleResponse<{ ok: boolean }>(response);
+}
+
+export async function getReceipts(): Promise<Transaction[]> {
+  const response = await fetch(`${API_BASE_URL}/receipts`, {
+    cache: "no-store",
+  });
+
+  return handleResponse<Transaction[]>(response);
+}
+
+export async function createReceipt(payload: {
+  category: string;
+  subcategory?: string | null;
+  amount: number;
+  bank_id: number;
+  note?: string | null;
+}): Promise<Transaction> {
+  const response = await fetch(`${API_BASE_URL}/receipts`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  return handleResponse<Transaction>(response);
+}
+
+export async function updateReceipt(
+  id: number,
+  payload: {
+    category: string;
+    subcategory?: string | null;
+    amount: number;
+    bank_id: number;
+    note?: string | null;
+  }
+): Promise<Transaction> {
+  const response = await fetch(`${API_BASE_URL}/receipts/${id}`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  return handleResponse<Transaction>(response);
+}
+
+export async function deleteReceipt(id: number): Promise<{ ok: boolean }> {
+  const response = await fetch(`${API_BASE_URL}/receipts/${id}`, {
     method: "DELETE",
   });
 
