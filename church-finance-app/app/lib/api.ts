@@ -130,6 +130,64 @@ export type DashboardSummary = {
   savings_total: number;
 };
 
+export type ReportMoneyRow = {
+  name: string;
+  total: number;
+};
+
+export type ReportComparison = {
+  name: string;
+  current_month: number;
+  previous_month: number;
+  difference: number;
+  percentage_change: number;
+  direction: "rising" | "falling" | "stable";
+};
+
+export type MonthlyTrendRow = {
+  month: string;
+  receipts: number;
+  payments: number;
+  net: number;
+};
+
+export type LedgerRow = {
+  category: string;
+  subcategory: string;
+  entry_count: number;
+  total_amount: number;
+  first_date: string | null;
+  last_date: string | null;
+};
+
+export type ReportSummary = {
+  year: number;
+  current_month: string;
+  previous_month: string;
+  summary: {
+    total_receipts: number;
+    total_payments: number;
+    net: number;
+    bank_total: number;
+    savings_total: number;
+    petty_cash_balance: number;
+    total_assets: number;
+  };
+  comparisons: ReportComparison[];
+  income_breakdown: ReportMoneyRow[];
+  expense_breakdown: ReportMoneyRow[];
+  monthly_trend: MonthlyTrendRow[];
+  receipt_ledger: LedgerRow[];
+  payment_ledger: LedgerRow[];
+  balance_sheet: {
+    assets: {
+      banks: Bank[];
+      savings: SavingsAccount[];
+      petty_cash: number;
+      total_assets: number;
+    };
+  };
+};
 async function handleResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const error = await response.json().catch(() => null);
@@ -424,6 +482,29 @@ export async function deletePettyCashWithdrawal(
   return handleResponse<{ ok: boolean }>(response);
 }
 
+export async function getReportSummary(year?: number): Promise<ReportSummary> {
+  const query = year ? `?year=${year}` : "";
+
+  const response = await fetch(`${API_BASE_URL}/reports/summary${query}`, {
+    cache: "no-store",
+  });
+
+  return handleResponse<ReportSummary>(response);
+}
+export async function exportReportExcel(year?: number): Promise<Blob> {
+  const query = year ? `?year=${year}` : "";
+
+  const response = await fetch(`${API_BASE_URL}/reports/export-excel${query}`, {
+    cache: "no-store",
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => null);
+    throw new Error(error?.detail || "Failed to export Excel report.");
+  }
+
+  return response.blob();
+}
 export async function getDashboardSummary(): Promise<DashboardSummary> {
   const response = await fetch(`${API_BASE_URL}/dashboard/summary`, {
     cache: "no-store",

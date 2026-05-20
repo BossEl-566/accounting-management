@@ -7,7 +7,12 @@ from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from openpyxl import Workbook
+from openpyxl.chart import BarChart, LineChart, PieChart, Reference
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -2163,6 +2168,828 @@ def delete_payment_sheet(sheet_id: int):
 
     return {"ok": True, "message": "Payment sheet deleted successfully."}
 
+def month_key(value: date) -> str:
+    return value.strftime("%Y-%m")
+
+
+def previous_month_key(value: date) -> str:
+    year = value.year
+    month = value.month - 1
+
+    if month == 0:
+        month = 12
+        year -= 1
+
+    return f"{year:04d}-{month:02d}"
+
+
+def percentage_change(current: int, previous: int) -> float:
+    if previous == 0 and current == 0:
+        return 0
+
+    if previous == 0:
+        return 100
+
+    return round(((current - previous) / previous) * 100, 2)
+
+
+def movement_direction(current: int, previous: int) -> str:
+    if current > previous:
+        return "rising"
+
+    if current < previous:
+        return "falling"
+
+    return "stable"
+
+
+def serialize_report_money_row(row: sqlite3.Row):
+    return {
+        "name": row["name"],
+        "total": pesewas_to_money(row["total"]),
+    }
+
+
+def serialize_ledger_row(row: sqlite3.Row):
+    return {
+        "category": row["category"],
+        "subcategory": row["subcategory"],
+        "entry_count": row["entry_count"],
+        "total_amount": pesewas_to_money(row["total_amount"]),
+        "first_date": row["first_date"],
+        "last_date": row["last_date"],
+    }
+
+
+@app.get("/api/reports/summary")
+def get_reports_summary(year: Optional[int] = None):
+    report_year = year or date.today().year
+    year_prefix = f"{report_year:04d}-%"
+
+    today = date.today()
+    current_month = month_key(today)
+    previous_month = previous_month_key(today)
+
+    with get_connection() as conn:
+        total_receipts = conn.execute(
+            """
+            SELECT COALESCE(SUM(total_pesewas), 0) AS total
+            FROM receipt_sheets
+            WHERE status = 'posted'
+            AND sheet_date LIKE ?
+            """,
+            (year_prefix,),
+        ).fetchone()["total"]
+
+        total_payments = conn.execute(
+            """
+            SELECT COALESCE(SUM(total_pesewas), 0) AS total
+            FROM payment_sheets
+            WHERE status = 'posted'
+            AND sheet_date LIKE ?
+            """,
+            (year_prefix,),
+        ).fetchone()["total"]
+
+        bank_total = conn.execute(
+            """
+            SELECT COALESCE(SUM(balance_pesewas), 0) AS total
+            FROM banks
+            """
+        ).fetchone()["total"]
+
+        savings_total = conn.execute(
+            """
+            SELECT COALESCE(SUM(balance_pesewas), 0) AS total
+            FROM savings_accounts
+            """
+        ).fetchone()["total"]
+
+        petty_cash_balance = get_petty_cash_balance_pesewas(conn)
+
+        income_breakdown_rows = conn.execute(
+            """
+            SELECT
+                receipt_entries.category AS name,
+                COALESCE(SUM(receipt_entries.amount_pesewas), 0) AS total
+            FROM receipt_entries
+            INNER JOIN receipt_sheets ON receipt_sheets.id = receipt_entries.sheet_id
+            WHERE receipt_sheets.status = 'posted'
+            AND receipt_sheets.sheet_date LIKE ?
+            GROUP BY receipt_entries.category
+            ORDER BY total DESC
+            """,
+            (year_prefix,),
+        ).fetchall()
+
+        expense_breakdown_rows = conn.execute(
+            """
+            SELECT
+                payment_entries.category AS name,
+                COALESCE(SUM(payment_entries.amount_pesewas), 0) AS total
+            FROM payment_entries
+            INNER JOIN payment_sheets ON payment_sheets.id = payment_entries.sheet_id
+            WHERE payment_sheets.status = 'posted'
+            AND payment_sheets.sheet_date LIKE ?
+            GROUP BY payment_entries.category
+            ORDER BY total DESC
+            """,
+            (year_prefix,),
+        ).fetchall()
+
+        receipt_month_rows = conn.execute(
+            """
+            SELECT
+                substr(sheet_date, 1, 7) AS month,
+                COALESCE(SUM(total_pesewas), 0) AS total
+            FROM receipt_sheets
+            WHERE status = 'posted'
+            AND sheet_date LIKE ?
+            GROUP BY substr(sheet_date, 1, 7)
+            """,
+            (year_prefix,),
+        ).fetchall()
+
+        payment_month_rows = conn.execute(
+            """
+            SELECT
+                substr(sheet_date, 1, 7) AS month,
+                COALESCE(SUM(total_pesewas), 0) AS total
+            FROM payment_sheets
+            WHERE status = 'posted'
+            AND sheet_date LIKE ?
+            GROUP BY substr(sheet_date, 1, 7)
+            """,
+            (year_prefix,),
+        ).fetchall()
+
+        receipt_month_map = {
+            row["month"]: row["total"] for row in receipt_month_rows
+        }
+
+        payment_month_map = {
+            row["month"]: row["total"] for row in payment_month_rows
+        }
+
+        monthly_trend = []
+
+        for month_number in range(1, 13):
+            key = f"{report_year:04d}-{month_number:02d}"
+            receipts = receipt_month_map.get(key, 0)
+            payments = payment_month_map.get(key, 0)
+
+            monthly_trend.append(
+                {
+                    "month": key,
+                    "receipts": pesewas_to_money(receipts),
+                    "payments": pesewas_to_money(payments),
+                    "net": pesewas_to_money(receipts - payments),
+                }
+            )
+
+        def receipt_total_for_month(category: Optional[str], month: str):
+            if category:
+                row = conn.execute(
+                    """
+                    SELECT COALESCE(SUM(receipt_entries.amount_pesewas), 0) AS total
+                    FROM receipt_entries
+                    INNER JOIN receipt_sheets ON receipt_sheets.id = receipt_entries.sheet_id
+                    WHERE receipt_sheets.status = 'posted'
+                    AND receipt_sheets.sheet_date LIKE ?
+                    AND receipt_entries.category = ?
+                    """,
+                    (f"{month}%", category),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT COALESCE(SUM(total_pesewas), 0) AS total
+                    FROM receipt_sheets
+                    WHERE status = 'posted'
+                    AND sheet_date LIKE ?
+                    """,
+                    (f"{month}%",),
+                ).fetchone()
+
+            return row["total"]
+
+        def payment_total_for_month(month: str):
+            row = conn.execute(
+                """
+                SELECT COALESCE(SUM(total_pesewas), 0) AS total
+                FROM payment_sheets
+                WHERE status = 'posted'
+                AND sheet_date LIKE ?
+                """,
+                (f"{month}%",),
+            ).fetchone()
+
+            return row["total"]
+
+        current_tithe = receipt_total_for_month("Tithe", current_month)
+        previous_tithe = receipt_total_for_month("Tithe", previous_month)
+
+        current_receipts = receipt_total_for_month(None, current_month)
+        previous_receipts = receipt_total_for_month(None, previous_month)
+
+        current_payments = payment_total_for_month(current_month)
+        previous_payments = payment_total_for_month(previous_month)
+
+        comparisons = [
+            {
+                "name": "Tithe",
+                "current_month": pesewas_to_money(current_tithe),
+                "previous_month": pesewas_to_money(previous_tithe),
+                "difference": pesewas_to_money(current_tithe - previous_tithe),
+                "percentage_change": percentage_change(current_tithe, previous_tithe),
+                "direction": movement_direction(current_tithe, previous_tithe),
+            },
+            {
+                "name": "Total Receipts",
+                "current_month": pesewas_to_money(current_receipts),
+                "previous_month": pesewas_to_money(previous_receipts),
+                "difference": pesewas_to_money(current_receipts - previous_receipts),
+                "percentage_change": percentage_change(current_receipts, previous_receipts),
+                "direction": movement_direction(current_receipts, previous_receipts),
+            },
+            {
+                "name": "Total Payments",
+                "current_month": pesewas_to_money(current_payments),
+                "previous_month": pesewas_to_money(previous_payments),
+                "difference": pesewas_to_money(current_payments - previous_payments),
+                "percentage_change": percentage_change(current_payments, previous_payments),
+                "direction": movement_direction(current_payments, previous_payments),
+            },
+        ]
+
+        receipt_ledger_rows = conn.execute(
+            """
+            SELECT
+                receipt_entries.category,
+                receipt_entries.subcategory,
+                COUNT(*) AS entry_count,
+                COALESCE(SUM(receipt_entries.amount_pesewas), 0) AS total_amount,
+                MIN(receipt_sheets.sheet_date) AS first_date,
+                MAX(receipt_sheets.sheet_date) AS last_date
+            FROM receipt_entries
+            INNER JOIN receipt_sheets ON receipt_sheets.id = receipt_entries.sheet_id
+            WHERE receipt_sheets.status = 'posted'
+            AND receipt_sheets.sheet_date LIKE ?
+            GROUP BY receipt_entries.category, receipt_entries.subcategory
+            ORDER BY receipt_entries.category ASC, total_amount DESC
+            """,
+            (year_prefix,),
+        ).fetchall()
+
+        payment_ledger_rows = conn.execute(
+            """
+            SELECT
+                payment_entries.category,
+                payment_entries.subcategory,
+                COUNT(*) AS entry_count,
+                COALESCE(SUM(payment_entries.amount_pesewas), 0) AS total_amount,
+                MIN(payment_sheets.sheet_date) AS first_date,
+                MAX(payment_sheets.sheet_date) AS last_date
+            FROM payment_entries
+            INNER JOIN payment_sheets ON payment_sheets.id = payment_entries.sheet_id
+            WHERE payment_sheets.status = 'posted'
+            AND payment_sheets.sheet_date LIKE ?
+            GROUP BY payment_entries.category, payment_entries.subcategory
+            ORDER BY payment_entries.category ASC, total_amount DESC
+            """,
+            (year_prefix,),
+        ).fetchall()
+
+        bank_rows = conn.execute(
+            """
+            SELECT id, name, balance_pesewas, created_at, updated_at
+            FROM banks
+            ORDER BY name ASC
+            """
+        ).fetchall()
+
+        savings_rows = conn.execute(
+            """
+            SELECT id, name, balance_pesewas, created_at, updated_at
+            FROM savings_accounts
+            ORDER BY name ASC
+            """
+        ).fetchall()
+
+    total_assets = bank_total + savings_total + petty_cash_balance
+
+    return {
+        "year": report_year,
+        "current_month": current_month,
+        "previous_month": previous_month,
+        "summary": {
+            "total_receipts": pesewas_to_money(total_receipts),
+            "total_payments": pesewas_to_money(total_payments),
+            "net": pesewas_to_money(total_receipts - total_payments),
+            "bank_total": pesewas_to_money(bank_total),
+            "savings_total": pesewas_to_money(savings_total),
+            "petty_cash_balance": pesewas_to_money(petty_cash_balance),
+            "total_assets": pesewas_to_money(total_assets),
+        },
+        "comparisons": comparisons,
+        "income_breakdown": [
+            serialize_report_money_row(row) for row in income_breakdown_rows
+        ],
+        "expense_breakdown": [
+            serialize_report_money_row(row) for row in expense_breakdown_rows
+        ],
+        "monthly_trend": monthly_trend,
+        "receipt_ledger": [
+            serialize_ledger_row(row) for row in receipt_ledger_rows
+        ],
+        "payment_ledger": [
+            serialize_ledger_row(row) for row in payment_ledger_rows
+        ],
+        "balance_sheet": {
+            "assets": {
+                "banks": [serialize_bank(row) for row in bank_rows],
+                "savings": [serialize_savings_account(row) for row in savings_rows],
+                "petty_cash": pesewas_to_money(petty_cash_balance),
+                "total_assets": pesewas_to_money(total_assets),
+            }
+        },
+    }
+
+@app.get("/api/reports/export-excel")
+def export_report_excel(year: Optional[int] = None):
+    report_year = year or date.today().year
+    year_prefix = f"{report_year:04d}-%"
+
+    report = get_reports_summary(report_year)
+
+    reports_dir = BASE_DIR / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    file_path = reports_dir / f"church_finance_report_{report_year}.xlsx"
+
+    workbook = Workbook()
+
+    header_fill = PatternFill("solid", fgColor="1E293B")
+    header_font = Font(color="FFFFFF", bold=True)
+    title_font = Font(size=16, bold=True, color="0F172A")
+    subtitle_font = Font(size=11, bold=True, color="475569")
+    thin_border = Border(
+        left=Side(style="thin", color="E2E8F0"),
+        right=Side(style="thin", color="E2E8F0"),
+        top=Side(style="thin", color="E2E8F0"),
+        bottom=Side(style="thin", color="E2E8F0"),
+    )
+    money_format = '"GHS" #,##0.00'
+
+    def apply_header_style(sheet, row_number: int):
+        for cell in sheet[row_number]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center")
+            cell.border = thin_border
+
+    def apply_table_style(sheet, money_columns=None):
+        money_columns = money_columns or []
+
+        for row in sheet.iter_rows():
+            for cell in row:
+                cell.border = thin_border
+                cell.alignment = Alignment(vertical="center")
+
+        for column_index in money_columns:
+            for row_number in range(2, sheet.max_row + 1):
+                sheet.cell(row=row_number, column=column_index).number_format = money_format
+
+        for column_cells in sheet.columns:
+            max_length = 0
+            column_letter = get_column_letter(column_cells[0].column)
+
+            for cell in column_cells:
+                value = "" if cell.value is None else str(cell.value)
+                max_length = max(max_length, len(value))
+
+            sheet.column_dimensions[column_letter].width = min(max_length + 4, 45)
+
+    def add_table(sheet, headers, rows, money_columns=None):
+        sheet.append(headers)
+        apply_header_style(sheet, 1)
+
+        for row in rows:
+            sheet.append(row)
+
+        sheet.freeze_panes = "A2"
+        apply_table_style(sheet, money_columns)
+
+    # -------------------------
+    # Summary Sheet
+    # -------------------------
+    summary_sheet = workbook.active
+    summary_sheet.title = "Summary"
+
+    summary_sheet["A1"] = "Church Finance Report"
+    summary_sheet["A1"].font = title_font
+
+    summary_sheet["A2"] = f"Financial Year: {report_year}"
+    summary_sheet["A2"].font = subtitle_font
+
+    summary_rows = [
+        ["Total Receipts", report["summary"]["total_receipts"]],
+        ["Total Payments", report["summary"]["total_payments"]],
+        ["Net Position", report["summary"]["net"]],
+        ["Bank Total", report["summary"]["bank_total"]],
+        ["Savings Total", report["summary"]["savings_total"]],
+        ["Petty Cash Balance", report["summary"]["petty_cash_balance"]],
+        ["Total Assets", report["summary"]["total_assets"]],
+    ]
+
+    summary_sheet.append([])
+    summary_sheet.append(["Metric", "Amount"])
+
+    for row in summary_rows:
+        summary_sheet.append(row)
+
+    apply_header_style(summary_sheet, 4)
+
+    for row_number in range(5, 5 + len(summary_rows)):
+        summary_sheet.cell(row=row_number, column=2).number_format = money_format
+
+    apply_table_style(summary_sheet, [2])
+
+    comparison_start = 14
+    summary_sheet.cell(row=comparison_start, column=1, value="Month-to-Month Comparison")
+    summary_sheet.cell(row=comparison_start, column=1).font = title_font
+
+    comparison_headers = [
+        "Name",
+        "Previous Month",
+        "Current Month",
+        "Difference",
+        "Change %",
+        "Direction",
+    ]
+
+    for col_index, header in enumerate(comparison_headers, start=1):
+        cell = summary_sheet.cell(row=comparison_start + 1, column=col_index, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.border = thin_border
+
+    for row_index, item in enumerate(report["comparisons"], start=comparison_start + 2):
+        summary_sheet.cell(row=row_index, column=1, value=item["name"])
+        summary_sheet.cell(row=row_index, column=2, value=item["previous_month"])
+        summary_sheet.cell(row=row_index, column=3, value=item["current_month"])
+        summary_sheet.cell(row=row_index, column=4, value=item["difference"])
+        summary_sheet.cell(row=row_index, column=5, value=item["percentage_change"])
+        summary_sheet.cell(row=row_index, column=6, value=item["direction"])
+
+        for col_index in [2, 3, 4]:
+            summary_sheet.cell(row=row_index, column=col_index).number_format = money_format
+
+    # -------------------------
+    # Monthly Trend Sheet
+    # -------------------------
+    trend_sheet = workbook.create_sheet("Monthly Trend")
+    trend_rows = [
+        [
+            row["month"],
+            row["receipts"],
+            row["payments"],
+            row["net"],
+        ]
+        for row in report["monthly_trend"]
+    ]
+
+    add_table(
+        trend_sheet,
+        ["Month", "Receipts", "Payments", "Net"],
+        trend_rows,
+        money_columns=[2, 3, 4],
+    )
+
+    line_chart = LineChart()
+    line_chart.title = "Monthly Receipts vs Payments"
+    line_chart.y_axis.title = "Amount"
+    line_chart.x_axis.title = "Month"
+
+    data = Reference(trend_sheet, min_col=2, max_col=3, min_row=1, max_row=13)
+    categories = Reference(trend_sheet, min_col=1, min_row=2, max_row=13)
+    line_chart.add_data(data, titles_from_data=True)
+    line_chart.set_categories(categories)
+    line_chart.height = 10
+    line_chart.width = 20
+    trend_sheet.add_chart(line_chart, "F2")
+
+    bar_chart = BarChart()
+    bar_chart.title = "Net Movement"
+    bar_chart.y_axis.title = "Net Amount"
+    bar_chart.x_axis.title = "Month"
+
+    net_data = Reference(trend_sheet, min_col=4, min_row=1, max_row=13)
+    bar_chart.add_data(net_data, titles_from_data=True)
+    bar_chart.set_categories(categories)
+    bar_chart.height = 10
+    bar_chart.width = 20
+    trend_sheet.add_chart(bar_chart, "F22")
+
+    # -------------------------
+    # Income Breakdown
+    # -------------------------
+    income_sheet = workbook.create_sheet("Income Breakdown")
+    income_rows = [[row["name"], row["total"]] for row in report["income_breakdown"]]
+
+    add_table(
+        income_sheet,
+        ["Category", "Total"],
+        income_rows,
+        money_columns=[2],
+    )
+
+    if len(income_rows) > 0:
+        income_chart = PieChart()
+        income_chart.title = "Income Breakdown"
+
+        income_data = Reference(income_sheet, min_col=2, min_row=1, max_row=len(income_rows) + 1)
+        income_labels = Reference(income_sheet, min_col=1, min_row=2, max_row=len(income_rows) + 1)
+
+        income_chart.add_data(income_data, titles_from_data=True)
+        income_chart.set_categories(income_labels)
+        income_chart.height = 10
+        income_chart.width = 15
+        income_sheet.add_chart(income_chart, "D2")
+
+    # -------------------------
+    # Expense Breakdown
+    # -------------------------
+    expense_sheet = workbook.create_sheet("Expense Breakdown")
+    expense_rows = [[row["name"], row["total"]] for row in report["expense_breakdown"]]
+
+    add_table(
+        expense_sheet,
+        ["Category", "Total"],
+        expense_rows,
+        money_columns=[2],
+    )
+
+    if len(expense_rows) > 0:
+        expense_chart = PieChart()
+        expense_chart.title = "Expense Breakdown"
+
+        expense_data = Reference(expense_sheet, min_col=2, min_row=1, max_row=len(expense_rows) + 1)
+        expense_labels = Reference(expense_sheet, min_col=1, min_row=2, max_row=len(expense_rows) + 1)
+
+        expense_chart.add_data(expense_data, titles_from_data=True)
+        expense_chart.set_categories(expense_labels)
+        expense_chart.height = 10
+        expense_chart.width = 15
+        expense_sheet.add_chart(expense_chart, "D2")
+
+    # -------------------------
+    # Receipt Ledger
+    # -------------------------
+    receipt_ledger_sheet = workbook.create_sheet("Receipt Ledger")
+    receipt_ledger_rows = [
+        [
+            row["category"],
+            row["subcategory"],
+            row["entry_count"],
+            row["total_amount"],
+            row["first_date"],
+            row["last_date"],
+        ]
+        for row in report["receipt_ledger"]
+    ]
+
+    add_table(
+        receipt_ledger_sheet,
+        ["Category", "Field", "Entries", "Total", "First Date", "Last Date"],
+        receipt_ledger_rows,
+        money_columns=[4],
+    )
+
+    # -------------------------
+    # Payment Ledger
+    # -------------------------
+    payment_ledger_sheet = workbook.create_sheet("Payment Ledger")
+    payment_ledger_rows = [
+        [
+            row["category"],
+            row["subcategory"],
+            row["entry_count"],
+            row["total_amount"],
+            row["first_date"],
+            row["last_date"],
+        ]
+        for row in report["payment_ledger"]
+    ]
+
+    add_table(
+        payment_ledger_sheet,
+        ["Category", "Field", "Entries", "Total", "First Date", "Last Date"],
+        payment_ledger_rows,
+        money_columns=[4],
+    )
+
+    with get_connection() as conn:
+        receipt_details = conn.execute(
+            """
+            SELECT
+                receipt_sheets.sheet_date,
+                receipt_sheets.title AS sheet_title,
+                receipt_entries.category,
+                receipt_entries.subcategory,
+                receipt_entries.amount_pesewas,
+                banks.name AS bank_name,
+                receipt_entries.note
+            FROM receipt_entries
+            INNER JOIN receipt_sheets ON receipt_sheets.id = receipt_entries.sheet_id
+            INNER JOIN banks ON banks.id = receipt_entries.bank_id
+            WHERE receipt_sheets.status = 'posted'
+            AND receipt_sheets.sheet_date LIKE ?
+            ORDER BY receipt_sheets.sheet_date ASC, receipt_entries.id ASC
+            """,
+            (year_prefix,),
+        ).fetchall()
+
+        payment_details = conn.execute(
+            """
+            SELECT
+                payment_sheets.sheet_date,
+                payment_sheets.title AS sheet_title,
+                payment_entries.category,
+                payment_entries.subcategory,
+                payment_entries.amount_pesewas,
+                payment_entries.source,
+                CASE
+                    WHEN payment_entries.source = 'bank' THEN banks.name
+                    WHEN payment_entries.source = 'savings' THEN savings_accounts.name
+                    ELSE 'Petty Cash'
+                END AS account_name,
+                payment_entries.note
+            FROM payment_entries
+            INNER JOIN payment_sheets ON payment_sheets.id = payment_entries.sheet_id
+            LEFT JOIN banks ON banks.id = payment_entries.bank_id
+            LEFT JOIN savings_accounts ON savings_accounts.id = payment_entries.savings_account_id
+            WHERE payment_sheets.status = 'posted'
+            AND payment_sheets.sheet_date LIKE ?
+            ORDER BY payment_sheets.sheet_date ASC, payment_entries.id ASC
+            """,
+            (year_prefix,),
+        ).fetchall()
+
+        savings_transfers = conn.execute(
+            """
+            SELECT
+                savings_transfers.created_at,
+                banks.name AS bank_name,
+                savings_accounts.name AS savings_account_name,
+                savings_transfers.amount_pesewas,
+                savings_transfers.note
+            FROM savings_transfers
+            INNER JOIN banks ON banks.id = savings_transfers.bank_id
+            INNER JOIN savings_accounts ON savings_accounts.id = savings_transfers.savings_account_id
+            WHERE savings_transfers.created_at LIKE ?
+            ORDER BY savings_transfers.created_at ASC
+            """,
+            (year_prefix,),
+        ).fetchall()
+
+        petty_cash_withdrawals = conn.execute(
+            """
+            SELECT
+                petty_cash_withdrawals.created_at,
+                banks.name AS bank_name,
+                petty_cash_withdrawals.amount_pesewas,
+                petty_cash_withdrawals.note
+            FROM petty_cash_withdrawals
+            INNER JOIN banks ON banks.id = petty_cash_withdrawals.bank_id
+            WHERE petty_cash_withdrawals.created_at LIKE ?
+            ORDER BY petty_cash_withdrawals.created_at ASC
+            """,
+            (year_prefix,),
+        ).fetchall()
+
+    # -------------------------
+    # Receipt Details
+    # -------------------------
+    receipt_details_sheet = workbook.create_sheet("Receipt Details")
+    receipt_detail_rows = [
+        [
+            row["sheet_date"],
+            row["sheet_title"],
+            row["category"],
+            row["subcategory"],
+            pesewas_to_money(row["amount_pesewas"]),
+            row["bank_name"],
+            row["note"] or "",
+        ]
+        for row in receipt_details
+    ]
+
+    add_table(
+        receipt_details_sheet,
+        ["Date", "Sheet", "Category", "Field", "Amount", "Bank", "Note"],
+        receipt_detail_rows,
+        money_columns=[5],
+    )
+
+    # -------------------------
+    # Payment Details
+    # -------------------------
+    payment_details_sheet = workbook.create_sheet("Payment Details")
+    payment_detail_rows = [
+        [
+            row["sheet_date"],
+            row["sheet_title"],
+            row["category"],
+            row["subcategory"],
+            pesewas_to_money(row["amount_pesewas"]),
+            row["source"],
+            row["account_name"],
+            row["note"] or "",
+        ]
+        for row in payment_details
+    ]
+
+    add_table(
+        payment_details_sheet,
+        ["Date", "Sheet", "Category", "Field", "Amount", "Source", "Account", "Note"],
+        payment_detail_rows,
+        money_columns=[5],
+    )
+
+    # -------------------------
+    # Balance Sheet
+    # -------------------------
+    balance_sheet = workbook.create_sheet("Balance Sheet")
+
+    balance_rows = []
+
+    for bank in report["balance_sheet"]["assets"]["banks"]:
+        balance_rows.append(["Bank", bank["name"], bank["balance"]])
+
+    for savings in report["balance_sheet"]["assets"]["savings"]:
+        balance_rows.append(["Savings", savings["name"], savings["balance"]])
+
+    balance_rows.append(["Petty Cash", "Petty Cash", report["summary"]["petty_cash_balance"]])
+    balance_rows.append(["Total Assets", "Total Assets", report["summary"]["total_assets"]])
+
+    add_table(
+        balance_sheet,
+        ["Asset Type", "Account", "Amount"],
+        balance_rows,
+        money_columns=[3],
+    )
+
+    # -------------------------
+    # Savings Transfers
+    # -------------------------
+    savings_transfer_sheet = workbook.create_sheet("Savings Transfers")
+    savings_transfer_rows = [
+        [
+            row["created_at"],
+            row["bank_name"],
+            row["savings_account_name"],
+            pesewas_to_money(row["amount_pesewas"]),
+            row["note"] or "",
+        ]
+        for row in savings_transfers
+    ]
+
+    add_table(
+        savings_transfer_sheet,
+        ["Date", "From Bank", "To Savings", "Amount", "Note"],
+        savings_transfer_rows,
+        money_columns=[4],
+    )
+
+    # -------------------------
+    # Petty Cash Withdrawals
+    # -------------------------
+    petty_sheet = workbook.create_sheet("Petty Cash Withdrawals")
+    petty_rows = [
+        [
+            row["created_at"],
+            row["bank_name"],
+            pesewas_to_money(row["amount_pesewas"]),
+            row["note"] or "",
+        ]
+        for row in petty_cash_withdrawals
+    ]
+
+    add_table(
+        petty_sheet,
+        ["Date", "Bank", "Amount", "Note"],
+        petty_rows,
+        money_columns=[3],
+    )
+
+    workbook.save(file_path)
+
+    return FileResponse(
+        path=file_path,
+        filename=file_path.name,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 @app.get("/api/dashboard/summary")
 def dashboard_summary():
