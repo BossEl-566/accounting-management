@@ -1,3 +1,4 @@
+import shutil
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
@@ -5,7 +6,7 @@ from pathlib import Path
 import sqlite3
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -743,6 +744,51 @@ def create_clean_database_copy(target_path: Path):
 
         conn.execute("PRAGMA foreign_keys = ON")
         conn.commit()
+REQUIRED_RESTORE_TABLES = {
+    "banks",
+    "receipt_sheets",
+    "receipt_entries",
+    "payment_sheets",
+    "payment_entries",
+}
+
+
+def validate_restore_database_file(candidate_path: Path):
+    try:
+        with sqlite3.connect(candidate_path) as conn:
+            integrity_result = conn.execute("PRAGMA integrity_check").fetchone()[0]
+
+            if integrity_result != "ok":
+                raise HTTPException(
+                    status_code=400,
+                    detail="The selected database file is corrupted.",
+                )
+
+            rows = conn.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table'
+                """
+            ).fetchall()
+
+            table_names = {row[0] for row in rows}
+            missing_tables = REQUIRED_RESTORE_TABLES - table_names
+
+            if missing_tables:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "This file does not look like a valid Church Finance "
+                        f"database. Missing tables: {', '.join(sorted(missing_tables))}"
+                    ),
+                )
+
+    except sqlite3.DatabaseError:
+        raise HTTPException(
+            status_code=400,
+            detail="The selected file is not a valid SQLite database.",
+        )
 def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -3197,6 +3243,63 @@ def download_clean_database():
         filename=clean_path.name,
         media_type="application/octet-stream",
     )
+@app.post("/api/settings/restore-database")
+async def restore_database_backup(file: UploadFile = File(...)):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file was selected.")
+
+    if not file.filename.lower().endswith(".db"):
+        raise HTTPException(
+            status_code=400,
+            detail="Only .db database backup files are allowed.",
+        )
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    restore_upload_dir = BASE_DIR / "restore_uploads"
+    restore_upload_dir.mkdir(parents=True, exist_ok=True)
+
+    temp_restore_path = restore_upload_dir / f"restore_upload_{timestamp}.db"
+
+    safety_backup_path = (
+        BASE_DIR / "backups" / f"before_restore_backup_{timestamp}.db"
+    )
+
+    try:
+        uploaded_bytes = await file.read()
+
+        if len(uploaded_bytes) == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="The selected database file is empty.",
+            )
+
+        temp_restore_path.write_bytes(uploaded_bytes)
+
+        validate_restore_database_file(temp_restore_path)
+
+        # Always backup the current database before replacing it.
+        backup_database_to_file(safety_backup_path)
+
+        shutil.copyfile(temp_restore_path, DB_PATH)
+
+        # Run migrations/default setup after restore.
+        # This helps older valid backups receive newer tables/settings.
+        init_db()
+
+        return {
+            "ok": True,
+            "message": "Database restored successfully. Please restart the app to reload all data.",
+            "restored_filename": file.filename,
+            "safety_backup": str(safety_backup_path),
+        }
+
+    finally:
+        try:
+            if temp_restore_path.exists():
+                temp_restore_path.unlink()
+        except OSError:
+            pass
 @app.get("/api/dashboard/summary")
 def dashboard_summary():
     with get_connection() as conn:

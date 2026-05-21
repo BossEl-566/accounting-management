@@ -8,6 +8,7 @@ import {
   FileArchive,
   Save,
   Settings,
+  Upload,
 } from "lucide-react";
 
 import {
@@ -15,6 +16,7 @@ import {
   downloadCleanDatabase,
   downloadDatabaseBackup,
   getSettings,
+  restoreDatabaseBackup,
   updateSettings,
 } from "../lib/api";
 
@@ -46,6 +48,8 @@ export default function SettingsPage() {
   const [loading, setLoading] = useState(true);
   const [downloadingBackup, setDownloadingBackup] = useState(false);
   const [generatingCleanDb, setGeneratingCleanDb] = useState(false);
+  const [restoreFile, setRestoreFile] = useState<File | null>(null);
+const [restoringDatabase, setRestoringDatabase] = useState(false);
 
   async function loadSettings() {
     try {
@@ -151,6 +155,35 @@ export default function SettingsPage() {
       setGeneratingCleanDb(false);
     }
   }
+  async function handleRestoreDatabase() {
+  if (!restoreFile) {
+    setError("Please select a .db backup file first.");
+    return;
+  }
+
+  const confirmed = window.confirm(
+    "Restore this database backup? Your current database will be backed up first, then replaced. After restore, restart the app."
+  );
+
+  if (!confirmed) return;
+
+  try {
+    setRestoringDatabase(true);
+    setError("");
+    setSuccess("");
+
+    const result = await restoreDatabaseBackup(restoreFile);
+
+    setRestoreFile(null);
+    setSuccess(result.message);
+  } catch (err) {
+    setError(
+      err instanceof Error ? err.message : "Failed to restore database backup."
+    );
+  } finally {
+    setRestoringDatabase(false);
+  }
+}
 
   return (
     <div className="space-y-8">
@@ -303,7 +336,7 @@ export default function SettingsPage() {
             </button>
           </form>
 
-          <section className="grid grid-cols-2 gap-6">
+          <section className="grid grid-cols-3 gap-6">
             <div className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
               <div className="flex items-center gap-3">
                 <div className="rounded-2xl bg-green-50 p-3 text-green-600">
@@ -360,6 +393,48 @@ export default function SettingsPage() {
                   : "Generate Clean Database"}
               </button>
             </div>
+            <div className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
+  <div className="flex items-center gap-3">
+    <div className="rounded-2xl bg-red-50 p-3 text-red-600">
+      <Upload size={20} />
+    </div>
+
+    <div>
+      <h2 className="text-lg font-black text-slate-950">
+        Restore Database Backup
+      </h2>
+      <p className="mt-1 text-sm text-slate-500">
+        Upload a previous .db backup and restore the system data.
+      </p>
+    </div>
+  </div>
+
+  <input
+    type="file"
+    accept=".db"
+    onChange={(event) => {
+      const selectedFile = event.target.files?.[0] ?? null;
+      setRestoreFile(selectedFile);
+    }}
+    className="mt-6 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-semibold text-slate-700 outline-none"
+  />
+
+  {restoreFile && (
+    <p className="mt-3 text-xs font-bold text-slate-500">
+      Selected: {restoreFile.name}
+    </p>
+  )}
+
+  <button
+    type="button"
+    onClick={handleRestoreDatabase}
+    disabled={restoringDatabase}
+    className="mt-4 flex w-full items-center justify-center gap-2 rounded-2xl bg-red-600 px-6 py-3 text-sm font-black text-white shadow-lg shadow-red-200 transition hover:bg-red-700 disabled:bg-slate-300 disabled:shadow-none"
+  >
+    <Upload size={17} />
+    {restoringDatabase ? "Restoring..." : "Restore Backup"}
+  </button>
+</div>
           </section>
         </>
       )}

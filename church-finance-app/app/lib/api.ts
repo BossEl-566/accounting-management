@@ -197,6 +197,13 @@ export type AppSettings = {
   currency: string;
   financial_year_start_month: number;
 };
+
+export type RestoreDatabaseResponse = {
+  ok: boolean;
+  message: string;
+  restored_filename: string;
+  safety_backup: string;
+};
 async function handleResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const error = await response.json().catch(() => null);
@@ -559,6 +566,25 @@ export async function downloadCleanDatabase(): Promise<Blob> {
   }
 
   return response.blob();
+}
+
+export async function restoreDatabaseBackup(
+  file: File
+): Promise<RestoreDatabaseResponse> {
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const response = await fetch(`${API_BASE_URL}/settings/restore-database`, {
+    method: "POST",
+    body: formData,
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => null);
+    throw new Error(error?.detail || "Failed to restore database backup.");
+  }
+
+  return response.json();
 }
 export async function getDashboardSummary(): Promise<DashboardSummary> {
   const response = await fetch(`${API_BASE_URL}/dashboard/summary`, {
