@@ -45,6 +45,11 @@ const navItems = [
     href: "/savings",
     icon: PiggyBank,
   },
+  {
+  name: "Settings",
+  href: "/settings",
+  icon: Settings,
+},
 ];
 
 export default function AppShell({

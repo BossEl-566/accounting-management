@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 import sqlite3
@@ -17,6 +17,15 @@ from openpyxl.utils import get_column_letter
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DB_PATH = BASE_DIR / "database" / "church_finance.db"
+
+APP_SETTING_DEFAULTS = {
+    "church_name": "Church Finance",
+    "church_address": "",
+    "pastor_name": "",
+    "treasurer_name": "",
+    "currency": "GHS",
+    "financial_year_start_month": "1",
+}
 
 PETTY_CASH_ALLOWED_CATEGORIES = {
     "Utilities",
@@ -633,7 +642,107 @@ def replace_payment_entries(
 
     return total_pesewas
 
+def get_app_settings(conn: sqlite3.Connection):
+    rows = conn.execute(
+        """
+        SELECT key, value
+        FROM app_settings
+        """
+    ).fetchall()
 
+    settings = APP_SETTING_DEFAULTS.copy()
+
+    for row in rows:
+        settings[row["key"]] = row["value"]
+
+    return {
+        "church_name": settings["church_name"],
+        "church_address": settings["church_address"],
+        "pastor_name": settings["pastor_name"],
+        "treasurer_name": settings["treasurer_name"],
+        "currency": settings["currency"],
+        "financial_year_start_month": int(settings["financial_year_start_month"]),
+    }
+
+
+def backup_database_to_file(target_path: Path):
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with sqlite3.connect(DB_PATH) as source:
+        with sqlite3.connect(target_path) as target:
+            source.backup(target)
+
+
+def create_clean_database_copy(target_path: Path):
+    backup_database_to_file(target_path)
+
+    with sqlite3.connect(target_path) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = OFF")
+
+        tables_to_clear = [
+            "receipt_entries",
+            "receipt_sheets",
+            "payment_entries",
+            "payment_sheets",
+            "savings_transfers",
+            "petty_cash_withdrawals",
+            "transactions",
+        ]
+
+        for table in tables_to_clear:
+            conn.execute(f"DELETE FROM {table}")
+
+        conn.execute(
+            """
+            UPDATE banks
+            SET balance_pesewas = 0,
+                updated_at = CURRENT_TIMESTAMP
+            """
+        )
+
+        conn.execute(
+            """
+            UPDATE savings_accounts
+            SET balance_pesewas = 0,
+                updated_at = CURRENT_TIMESTAMP
+            """
+        )
+
+        conn.execute("DELETE FROM app_settings")
+
+        clean_defaults = APP_SETTING_DEFAULTS.copy()
+        clean_defaults["church_name"] = "New Church"
+
+        for key, value in clean_defaults.items():
+            conn.execute(
+                """
+                INSERT INTO app_settings (key, value, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                """,
+                (key, str(value)),
+            )
+
+        try:
+            conn.execute(
+                """
+                DELETE FROM sqlite_sequence
+                WHERE name IN (
+                    'receipt_entries',
+                    'receipt_sheets',
+                    'payment_entries',
+                    'payment_sheets',
+                    'savings_transfers',
+                    'petty_cash_withdrawals',
+                    'transactions'
+                )
+                """
+            )
+        except sqlite3.OperationalError:
+            pass
+
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.commit()
 def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -645,6 +754,16 @@ def init_db():
                 name TEXT NOT NULL UNIQUE,
                 balance_pesewas INTEGER NOT NULL DEFAULT 0 CHECK(balance_pesewas >= 0),
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
             """
@@ -795,6 +914,14 @@ def init_db():
             )
 
         ensure_payment_entries_schema(conn)
+        for key, value in APP_SETTING_DEFAULTS.items():
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO app_settings (key, value)
+                VALUES (?, ?)
+                """,
+                (key, str(value)),
+            )
 
         conn.commit()
 
@@ -892,6 +1019,14 @@ class PettyCashWithdrawalCreate(BaseModel):
     bank_id: int
     amount: Decimal = Field(gt=0)
     note: Optional[str] = None
+
+class AppSettingsUpdate(BaseModel):
+    church_name: Optional[str] = Field(default=None, min_length=2)
+    church_address: Optional[str] = None
+    pastor_name: Optional[str] = None
+    treasurer_name: Optional[str] = None
+    currency: Optional[str] = Field(default=None, min_length=3, max_length=3)
+    financial_year_start_month: Optional[int] = Field(default=None, ge=1, le=12)
 
 
 @app.get("/api/health")
@@ -2990,7 +3125,78 @@ def export_report_excel(year: Optional[int] = None):
         filename=file_path.name,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+@app.get("/api/settings")
+def get_settings():
+    with get_connection() as conn:
+        return get_app_settings(conn)
 
+
+@app.patch("/api/settings")
+def update_settings(payload: AppSettingsUpdate):
+    payload_data = (
+        payload.model_dump(exclude_unset=True)
+        if hasattr(payload, "model_dump")
+        else payload.dict(exclude_unset=True)
+    )
+
+    if not payload_data:
+        raise HTTPException(status_code=400, detail="No settings were provided.")
+
+    allowed_keys = set(APP_SETTING_DEFAULTS.keys())
+
+    with get_connection() as conn:
+        for key, value in payload_data.items():
+            if key not in allowed_keys:
+                continue
+
+            if value is None:
+                value = ""
+
+            if key == "currency":
+                value = str(value).upper()
+
+            conn.execute(
+                """
+                INSERT INTO app_settings (key, value, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (key, str(value)),
+            )
+
+        conn.commit()
+
+        return get_app_settings(conn)
+
+
+@app.get("/api/settings/backup-database")
+def download_database_backup():
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = BASE_DIR / "backups" / f"church_finance_backup_{timestamp}.db"
+
+    backup_database_to_file(backup_path)
+
+    return FileResponse(
+        path=backup_path,
+        filename=backup_path.name,
+        media_type="application/octet-stream",
+    )
+
+
+@app.get("/api/settings/clean-database")
+def download_clean_database():
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    clean_path = BASE_DIR / "backups" / f"church_finance_clean_template_{timestamp}.db"
+
+    create_clean_database_copy(clean_path)
+
+    return FileResponse(
+        path=clean_path,
+        filename=clean_path.name,
+        media_type="application/octet-stream",
+    )
 @app.get("/api/dashboard/summary")
 def dashboard_summary():
     with get_connection() as conn:

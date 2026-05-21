@@ -188,6 +188,15 @@ export type ReportSummary = {
     };
   };
 };
+
+export type AppSettings = {
+  church_name: string;
+  church_address: string;
+  pastor_name: string;
+  treasurer_name: string;
+  currency: string;
+  financial_year_start_month: number;
+};
 async function handleResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const error = await response.json().catch(() => null);
@@ -501,6 +510,52 @@ export async function exportReportExcel(year?: number): Promise<Blob> {
   if (!response.ok) {
     const error = await response.json().catch(() => null);
     throw new Error(error?.detail || "Failed to export Excel report.");
+  }
+
+  return response.blob();
+}
+
+export async function getSettings(): Promise<AppSettings> {
+  const response = await fetch(`${API_BASE_URL}/settings`, {
+    cache: "no-store",
+  });
+
+  return handleResponse<AppSettings>(response);
+}
+
+export async function updateSettings(
+  payload: Partial<AppSettings>
+): Promise<AppSettings> {
+  const response = await fetch(`${API_BASE_URL}/settings`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  return handleResponse<AppSettings>(response);
+}
+
+export async function downloadDatabaseBackup(): Promise<Blob> {
+  const response = await fetch(`${API_BASE_URL}/settings/backup-database`, {
+    cache: "no-store",
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => null);
+    throw new Error(error?.detail || "Failed to download database backup.");
+  }
+
+  return response.blob();
+}
+
+export async function downloadCleanDatabase(): Promise<Blob> {
+  const response = await fetch(`${API_BASE_URL}/settings/clean-database`, {
+    cache: "no-store",
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => null);
+    throw new Error(error?.detail || "Failed to generate clean database.");
   }
 
   return response.blob();
